@@ -276,6 +276,10 @@ pub struct ExecConfig<'a> {
     /// matching an exact name or prefix pattern (e.g. `"AWS_*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
     pub allowed_env_vars: Option<Vec<String>>,
+    /// Unix socket paths denied by policy. Passed to the proxy filter install
+    /// so it enables sendto/sendmsg interception in addition to connect/bind.
+    #[cfg(target_os = "linux")]
+    pub denied_socket_paths: &'a [std::path::PathBuf],
 }
 
 #[derive(Clone, Copy)]
@@ -317,6 +321,11 @@ pub struct SupervisorConfig<'a> {
     /// Bind ports allowed for seccomp proxy-only fallback.
     #[cfg(target_os = "linux")]
     pub proxy_bind_ports: Vec<u16>,
+    /// Unix socket paths that the supervisor should deny connect()/sendmsg() to.
+    /// Enforced by the seccomp proxy filter handler on Linux to block sandbox
+    /// escape via AF_UNIX sockets (e.g., SSH agent, Docker).
+    #[cfg(target_os = "linux")]
+    pub denied_socket_paths: &'a [std::path::PathBuf],
 }
 
 #[cfg(target_os = "macos")]
@@ -654,6 +663,28 @@ pub fn execute_supervised(
         child_keep_fds.push(fd);
     }
 
+    // When the proxy filter will be installed, use a pipe to hand off the notify fd
+    // from child to parent. The proxy filter intercepts sendmsg, so SCM_RIGHTS
+    // transfer would deadlock. The child writes the raw fd number; the parent uses
+    // pidfd_getfd to duplicate it without sendmsg.
+    #[cfg(target_os = "linux")]
+    let proxy_fd_pipe: Option<[i32; 2]> = if config.seccomp_proxy_fallback {
+        let mut fds = [0_i32; 2];
+        // SAFETY: pipe2 with a valid array pointer is safe.
+        let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        if ret != 0 {
+            return Err(NonoError::SandboxInit(format!(
+                "pipe2 for proxy fd transfer failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // Child keeps the write end; keep it out of close_inherited_fds.
+        child_keep_fds.push(fds[1]);
+        Some(fds)
+    } else {
+        None
+    };
+
     // Compute max FD in parent (get_max_fd may allocate on Linux)
     let max_fd = get_max_fd();
 
@@ -769,10 +800,12 @@ pub fn execute_supervised(
             // On Linux with capability elevation: install seccomp-notify filter
             // AFTER Landlock. The kernel evaluates seccomp before LSM hooks
             // regardless of installation order, so the security properties are
-            // identical. All openat/openat2 from exec'd child are routed to
-            // the supervisor, which can inject fds for approved paths.
-            // Without elevation, seccomp is not installed — the child runs
-            // with static Landlock capabilities only.
+            // identical. All openat/openat2 from exec'd child are routed to the
+            // supervisor, which can inject fds for approved paths.
+            // Without elevation, seccomp is not installed — the child runs with
+            // static Landlock capabilities only.
+            // Unix socket deny is handled by the proxy filter (when active),
+            // not by this notify filter.
             //
             // On WSL2, seccomp user notification returns EBUSY because WSL2's
             // init already claims the notify listener. The main.rs guards should
@@ -832,7 +865,10 @@ pub fn execute_supervised(
 
                 // If the parent determined that seccomp proxy fallback is needed
                 // (Landlock ABI lacks AccessNet + ProxyOnly mode), install the
-                // proxy filter and send its notify fd to the parent.
+                // proxy filter and write its notify fd number to the pipe.
+                // sendmsg is intercepted by the filter when has_denied_sockets=true,
+                // so SCM_RIGHTS transfer would deadlock. Writing a plain i32 via
+                // write() is safe — write() is not intercepted by the proxy filter.
                 // On WSL2 this flag should already be false (guarded in main.rs),
                 // but check again to avoid EBUSY / _exit(126).
                 if config.seccomp_proxy_fallback && nono::sandbox::is_wsl2() {
@@ -849,18 +885,24 @@ pub fn execute_supervised(
                         nono::NetworkMode::ProxyOnly { bind_ports, .. } => !bind_ports.is_empty(),
                         _ => false,
                     };
-                    if let Some(fd) = child_sock_fd {
-                        match nono::sandbox::install_seccomp_proxy_filter(has_bind) {
+                    let has_denied_sockets = !config.denied_socket_paths.is_empty();
+                    if let Some(pipe_fds) = proxy_fd_pipe {
+                        match nono::sandbox::install_seccomp_proxy_filter(
+                            has_bind,
+                            has_denied_sockets,
+                        ) {
                             Ok(proxy_notify_fd) => {
-                                if let Err(e) = nono::supervisor::socket::send_fd_via_socket(
-                                    fd,
-                                    proxy_notify_fd.as_raw_fd(),
-                                ) {
-                                    let detail = format!(
-                                        "nono: failed to send proxy seccomp notify fd: {}\n",
-                                        e
-                                    );
-                                    let msg = detail.as_bytes();
+                                let raw_fd: i32 = proxy_notify_fd.as_raw_fd();
+                                // SAFETY: pipe_fds[1] is the write end of a valid pipe.
+                                let n = unsafe {
+                                    libc::write(
+                                        pipe_fds[1],
+                                        (&raw_fd as *const i32).cast::<libc::c_void>(),
+                                        std::mem::size_of::<i32>(),
+                                    )
+                                };
+                                if n != std::mem::size_of::<i32>() as isize {
+                                    let msg = b"nono: failed to write proxy notify fd to pipe\n";
                                     unsafe {
                                         libc::write(
                                             libc::STDERR_FILENO,
@@ -870,6 +912,15 @@ pub fn execute_supervised(
                                         libc::_exit(126);
                                     }
                                 }
+                                // Close write end; parent reads then uses pidfd_getfd to dup.
+                                unsafe { libc::close(pipe_fds[1]) };
+                                // Keep the notify fd alive until exec — parent holds a dup.
+                                // Must add to child_keep_fds: Landlock's restrict_self() opens
+                                // and closes many path fds, freeing slots ≤ max_fd. The proxy
+                                // notify fd may reuse one of those freed slots and would
+                                // otherwise be closed by close_inherited_fds.
+                                child_keep_fds.push(raw_fd);
+                                std::mem::forget(proxy_notify_fd);
                             }
                             Err(e) => {
                                 let detail =
@@ -1053,20 +1104,48 @@ pub fn execute_supervised(
             };
 
             // On Linux: if the parent determined seccomp proxy fallback is needed,
-            // receive the proxy notify fd from the child. Only attempt recv when
-            // we know the child will send it (both sides use the same flag).
+            // read the child's notify fd number from the pipe, then use
+            // pidfd_open + pidfd_getfd to duplicate it into the parent.
+            // This avoids sendmsg/SCM_RIGHTS, which the proxy filter intercepts
+            // when has_denied_sockets=true (causing a deadlock with the old approach).
             #[cfg(target_os = "linux")]
             let proxy_notify_fd: Option<OwnedFd> = if config.seccomp_proxy_fallback {
-                if let Some(ref sup_sock) = supervisor_sock {
-                    match sup_sock.recv_fd() {
-                        Ok(fd) => {
-                            debug!("Received proxy seccomp notify fd from child");
-                            Some(fd)
+                if let Some(pipe_fds) = proxy_fd_pipe {
+                    // Close write end in parent — child owns it.
+                    unsafe { libc::close(pipe_fds[1]) };
+                    let mut raw_fd_buf = [0i32; 1];
+                    // SAFETY: pipe_fds[0] is the read end of a valid pipe.
+                    let n = unsafe {
+                        libc::read(
+                            pipe_fds[0],
+                            raw_fd_buf.as_mut_ptr().cast::<libc::c_void>(),
+                            std::mem::size_of::<i32>(),
+                        )
+                    };
+                    unsafe { libc::close(pipe_fds[0]) };
+                    if n == std::mem::size_of::<i32>() as isize {
+                        let child_fd = raw_fd_buf[0];
+                        match nono::sandbox::pidfd_open(child.as_raw() as u32) {
+                            Ok(pidfd) => {
+                                match nono::sandbox::pidfd_getfd(pidfd.as_raw_fd(), child_fd) {
+                                    Ok(fd) => {
+                                        debug!("Received proxy seccomp notify fd from child via pidfd_getfd");
+                                        Some(fd)
+                                    }
+                                    Err(e) => {
+                                        warn!("pidfd_getfd for proxy notify fd failed: {}", e);
+                                        None
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("pidfd_open for proxy notify fd failed: {}", e);
+                                None
+                            }
                         }
-                        Err(e) => {
-                            warn!("Failed to receive proxy seccomp notify fd: {}", e);
-                            None
-                        }
+                    } else {
+                        warn!("Failed to read proxy notify fd from pipe");
+                        None
                     }
                 } else {
                     None
@@ -3284,6 +3363,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: &[],
         };
 
         // Fork a child that closes its socket end and exits immediately.
@@ -3382,6 +3463,8 @@ mod tests {
             proxy_port: 8080,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: &[],
         };
 
         match unsafe { fork() } {
@@ -3456,6 +3539,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: &[],
         };
 
         // Allowed origin: validation passes
@@ -3488,6 +3573,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: &[],
         };
 
         let result = validate_url("file:///etc/passwd", &config);
@@ -3518,6 +3605,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: &[],
         };
         let config_deny = SupervisorConfig {
             protected_roots: &[],
@@ -3532,6 +3621,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: &[],
         };
 
         // Localhost denied when not allowed
@@ -3567,6 +3658,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: &[],
         };
 
         let long_url = format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH));
@@ -3705,6 +3798,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: &[],
         };
 
         assert!(

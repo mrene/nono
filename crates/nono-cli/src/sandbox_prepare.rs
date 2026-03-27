@@ -423,6 +423,8 @@ pub(crate) struct PreparedSandbox {
     pub(crate) open_url_allow_localhost: bool,
     pub(crate) override_deny_paths: Vec<PathBuf>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
+    #[cfg(target_os = "linux")]
+    pub(crate) denied_socket_paths: Vec<PathBuf>,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -519,7 +521,11 @@ fn finalize_prepared_sandbox(
     silent: bool,
 ) -> Result<PreparedSandbox> {
     output::print_skipped_requested_paths(&collect_missing_cli_requested_paths(args), silent);
-    output::print_capabilities(&prepared.caps, args.verbose, silent);
+    #[cfg(target_os = "linux")]
+    let denied_sockets: &[PathBuf] = &prepared.denied_socket_paths;
+    #[cfg(not(target_os = "linux"))]
+    let denied_sockets: &[PathBuf] = &[];
+    output::print_capabilities(&prepared.caps, args.verbose, silent, denied_sockets);
 
     #[cfg(target_os = "linux")]
     output::print_abi_info(silent);
@@ -997,6 +1003,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 open_url_allow_localhost: false,
                 override_deny_paths: Vec::new(),
                 allowed_env_vars: None,
+                #[cfg(target_os = "linux")]
+                denied_socket_paths: Vec::new(),
             },
             args,
             silent,
@@ -1202,6 +1210,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     let loaded_policy = policy::load_embedded_policy()?;
     let deny_paths = policy::resolve_deny_paths_for_groups(&loaded_policy, &active_groups)?;
     policy::validate_deny_overlaps(&deny_paths, &caps)?;
+    #[cfg(target_os = "linux")]
+    let denied_socket_paths =
+        policy::resolve_socket_paths_for_groups(&loaded_policy, &active_groups)?;
     let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
     let allow_parent_of_protected = profile_allow_parent_of_protected;
     protected_paths::validate_caps_against_protected_roots(
@@ -1246,6 +1257,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             open_url_allow_localhost,
             override_deny_paths,
             allowed_env_vars: profile_allowed_env_vars,
+            #[cfg(target_os = "linux")]
+            denied_socket_paths,
         },
         args,
         silent,

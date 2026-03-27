@@ -98,6 +98,8 @@ pub(crate) struct ExecutionFlags {
     pub(crate) trust: TrustLaunchOptions,
     pub(crate) proxy: ProxyLaunchOptions,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
+    #[cfg(target_os = "linux")]
+    pub(crate) denied_socket_paths: Vec<PathBuf>,
 }
 
 impl ExecutionFlags {
@@ -121,6 +123,8 @@ impl ExecutionFlags {
             },
             proxy: ProxyLaunchOptions::default(),
             allowed_env_vars: None,
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: Vec::new(),
         })
     }
 }
@@ -233,6 +237,8 @@ pub(crate) fn prepare_run_launch_plan(
             trust,
             proxy,
             allowed_env_vars: prepared.allowed_env_vars,
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: prepared.denied_socket_paths,
         },
     })
 }

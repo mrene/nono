@@ -236,6 +236,7 @@ mod tests {
             "deny_macos_private".to_string(),
             "deny_shell_configs".to_string(),
             "deny_shell_history".to_string(),
+            "deny_socket_paths_linux".to_string(),
             "homebrew_linux".to_string(),
             "homebrew_macos".to_string(),
             "system_read_linux_core".to_string(),

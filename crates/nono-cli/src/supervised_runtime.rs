@@ -185,6 +185,8 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             nono::NetworkMode::ProxyOnly { bind_ports, .. } => bind_ports.clone(),
             _ => Vec::new(),
         },
+        #[cfg(target_os = "linux")]
+        denied_socket_paths: ctx.config.denied_socket_paths,
     };
 
     if !session.detached_start {

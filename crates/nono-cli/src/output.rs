@@ -54,7 +54,15 @@ pub fn print_banner(silent: bool) {
 /// When `verbose` is 0, only user-specified capabilities are shown (CLI flags
 /// and profile filesystem entries). System paths and group-resolved paths are
 /// hidden to reduce noise. Use `-v` to show all capabilities.
-pub fn print_capabilities(caps: &CapabilitySet, verbose: u8, silent: bool) {
+///
+/// `denied_socket_paths` lists Unix socket paths blocked by the seccomp supervisor
+/// (Linux only). Pass an empty slice on other platforms or when none are configured.
+pub fn print_capabilities(
+    caps: &CapabilitySet,
+    verbose: u8,
+    silent: bool,
+    denied_socket_paths: &[std::path::PathBuf],
+) {
     if silent {
         return;
     }
@@ -158,6 +166,14 @@ pub fn print_capabilities(caps: &CapabilitySet, verbose: u8, silent: bool) {
             "  {} {}",
             theme::badge(" ipc ", t.teal, BADGE_FG_DARK),
             theme::fg(&format!("localhost:{}", ports_str.join(", ")), t.subtext,),
+        );
+    }
+
+    for path in denied_socket_paths {
+        eprintln!(
+            "  {} {}",
+            theme::badge(" sock ", t.red, BADGE_FG_DARK),
+            theme::fg(&format!("denied: {}", path.display()), t.subtext),
         );
     }
 

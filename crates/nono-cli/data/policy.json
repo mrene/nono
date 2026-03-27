@@ -552,6 +552,18 @@
         ]
       }
     },
+    "deny_socket_paths_linux": {
+      "description": "Block privileged Unix domain sockets that could allow sandbox escape (Linux seccomp enforcement)",
+      "required": true,
+      "platform": "linux",
+      "deny": {
+        "sockets": [
+          "/run/docker.sock",
+          "/var/run/docker.sock",
+          "/run/dbus/system_bus_socket"
+        ]
+      }
+    },
     "dangerous_commands_linux": {
       "description": "Linux-specific commands blocked by default",
       "platform": "linux",
@@ -608,7 +620,8 @@
           "homebrew_linux",
           "dangerous_commands",
           "dangerous_commands_macos",
-          "dangerous_commands_linux"
+          "dangerous_commands_linux",
+          "deny_socket_paths_linux"
         ],
         "signal_mode": "isolated"
       },

@@ -248,6 +248,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         #[cfg(target_os = "linux")]
         seccomp_proxy_fallback,
         allowed_env_vars: flags.allowed_env_vars,
+        #[cfg(target_os = "linux")]
+        denied_socket_paths: &flags.denied_socket_paths,
     };
 
     match strategy {

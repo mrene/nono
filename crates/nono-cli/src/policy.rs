@@ -77,6 +77,11 @@ pub struct DenyOps {
     /// Paths denied all content access (read+write; metadata still allowed)
     #[serde(default)]
     pub access: Vec<String>,
+    /// Unix socket paths blocked via seccomp supervisor (Linux) or Seatbelt network-outbound (macOS).
+    /// Unlike `access`, these paths are not subject to Landlock deny-within-allow overlap validation
+    /// because they are enforced at the syscall level, not the filesystem level.
+    #[serde(default)]
+    pub sockets: Vec<String>,
     /// Block file deletion globally
     #[serde(default)]
     pub unlink: bool,
@@ -325,6 +330,10 @@ pub struct ResolvedGroups {
     /// On macOS these also generate platform_rules; on Linux they're
     /// validation-only since Landlock has no deny semantics.
     pub deny_paths: Vec<PathBuf>,
+    /// Expanded deny.sockets paths for seccomp supervisor enforcement.
+    /// These are not subject to Landlock overlap validation — they are enforced
+    /// via seccomp on Linux and Seatbelt network-outbound rules on macOS.
+    pub socket_paths: Vec<PathBuf>,
 }
 
 /// Resolve a list of group names into capability set entries and platform rules.
@@ -353,6 +362,7 @@ pub fn resolve_groups(
     let mut resolved_groups = Vec::new();
     let mut needs_unlink_overrides = false;
     let mut deny_paths = Vec::new();
+    let mut socket_paths = Vec::new();
 
     for name in group_names {
         let group = policy
@@ -370,7 +380,7 @@ pub fn resolve_groups(
             continue;
         }
 
-        if resolve_single_group(name, group, caps, &mut deny_paths)? {
+        if resolve_single_group(name, group, caps, &mut deny_paths, &mut socket_paths)? {
             needs_unlink_overrides = true;
         }
         resolved_groups.push(name.clone());
@@ -380,6 +390,7 @@ pub fn resolve_groups(
         names: resolved_groups,
         needs_unlink_overrides,
         deny_paths,
+        socket_paths,
     })
 }
 
@@ -390,6 +401,7 @@ fn resolve_single_group(
     group: &Group,
     caps: &mut CapabilitySet,
     deny_paths: &mut Vec<PathBuf>,
+    socket_paths: &mut Vec<PathBuf>,
 ) -> Result<bool> {
     let source = CapabilitySource::Group(group_name.to_string());
     let mut needs_unlink_overrides = false;
@@ -411,6 +423,10 @@ fn resolve_single_group(
     if let Some(deny) = &group.deny {
         for path_str in &deny.access {
             add_deny_access_rules(path_str, caps, deny_paths)?;
+        }
+
+        for path_str in &deny.sockets {
+            add_deny_socket_rules(path_str, caps, socket_paths)?;
         }
 
         // Seatbelt-only: global unlink denial. Landlock handles file/directory
@@ -700,6 +716,53 @@ pub(crate) fn add_deny_access_rules(
                     resolved.display(),
                     e
                 );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Collect a Unix socket path for seccomp/Seatbelt deny enforcement.
+///
+/// On Linux: adds to `socket_paths` for the seccomp supervisor to block at connect()/sendmsg().
+/// On macOS: adds a Seatbelt `(deny network-outbound (path ...))` rule and adds to `socket_paths`
+///   for display purposes.
+///
+/// Unlike `add_deny_access_rules`, these paths are NOT subject to Landlock deny-within-allow
+/// overlap validation because socket denial is a seccomp-level enforcement, not a filesystem
+/// Landlock rule. This allows denying sockets under broadly allowed directories (e.g.
+/// `/run/docker.sock` under `/run`).
+pub(crate) fn add_deny_socket_rules(
+    path_str: &str,
+    caps: &mut CapabilitySet,
+    socket_paths: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let path = expand_path(path_str)?;
+    socket_paths.push(path.clone());
+
+    // Also push the canonical path when it differs (e.g. /var/run -> /private/var/run on macOS)
+    if let Ok(canonical) = path.canonicalize() {
+        if canonical != path {
+            socket_paths.push(canonical.clone());
+        }
+    }
+
+    // On macOS, emit a Seatbelt network-outbound deny rule for the socket path.
+    // connect(2) on Unix domain sockets is enforced by Seatbelt as network-outbound,
+    // so a file-deny rule alone has no effect.
+    if cfg!(target_os = "macos") {
+        let escaped = escape_seatbelt_path(path_to_utf8(&path)?)?;
+        caps.add_platform_rule(format!("(deny network-outbound (path \"{}\"))", escaped))?;
+
+        // Also deny via the canonical path if it differs (parent symlink resolution)
+        if let Ok(canonical) = path.canonicalize() {
+            if canonical != path {
+                let escaped_canonical = escape_seatbelt_path(path_to_utf8(&canonical)?)?;
+                caps.add_platform_rule(format!(
+                    "(deny network-outbound (path \"{}\"))",
+                    escaped_canonical
+                ))?;
             }
         }
     }
@@ -1074,6 +1137,19 @@ pub fn resolve_deny_paths_for_groups(
     let mut tmp_caps = CapabilitySet::new();
     let resolved = resolve_groups(policy, group_names, &mut tmp_caps)?;
     Ok(resolved.deny_paths)
+}
+
+/// Resolve deny.sockets paths for a group list without mutating caller capabilities.
+///
+/// Returns the expanded socket paths from all `deny.sockets` entries in the specified groups.
+/// These paths are passed to the seccomp supervisor to block connect()/sendmsg() on Linux.
+pub fn resolve_socket_paths_for_groups(
+    policy: &Policy,
+    group_names: &[String],
+) -> Result<Vec<PathBuf>> {
+    let mut tmp_caps = CapabilitySet::new();
+    let resolved = resolve_groups(policy, group_names, &mut tmp_caps)?;
+    Ok(resolved.socket_paths)
 }
 
 /// Check for deny paths that overlap with allowed paths on Linux.

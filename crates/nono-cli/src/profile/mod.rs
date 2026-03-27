@@ -79,6 +79,10 @@ pub struct PolicyPatchConfig {
     /// Parsed for compatibility in v0.33.0, but not enforced for child processes.
     #[serde(default)]
     pub add_deny_commands: Vec<String>,
+    /// Additional unix socket paths to deny, extending deny.sockets from groups.
+    /// Supports `~`, `$HOME`, `$WORKDIR`, and `$TMPDIR` expansion.
+    #[serde(default)]
+    pub add_deny_sockets: Vec<String>,
     /// Paths to exempt from deny groups.
     /// Each path must also be explicitly granted via `filesystem` or `policy.add_allow_*`.
     /// Does not implicitly grant access; only removes the deny rule.
@@ -1763,6 +1767,10 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &base.policy.add_deny_commands,
                 &child.policy.add_deny_commands,
             ),
+            add_deny_sockets: dedup_append(
+                &base.policy.add_deny_sockets,
+                &child.policy.add_deny_sockets,
+            ),
             override_deny: dedup_append(&base.policy.override_deny, &child.policy.override_deny),
         },
         network: NetworkConfig {
@@ -3369,6 +3377,7 @@ mod tests {
                 add_allow_readwrite: vec![],
                 add_deny_access: vec!["/base/policy-deny".to_string()],
                 add_deny_commands: vec![],
+                add_deny_sockets: vec![],
                 override_deny: vec!["/base/override-deny".to_string()],
             },
             network: NetworkConfig {
@@ -3442,6 +3451,7 @@ mod tests {
                 add_allow_readwrite: vec!["/child/policy-rw".to_string()],
                 add_deny_access: vec!["/child/policy-deny".to_string()],
                 add_deny_commands: vec![],
+                add_deny_sockets: vec!["/child/socket".to_string()],
                 override_deny: vec!["/child/override-deny".to_string()],
             },
             network: NetworkConfig {
