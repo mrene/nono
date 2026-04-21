@@ -30,4 +30,4 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: always-further/agent-sign@8d70fb7bdcdfb921a1613d0701ca44c7d6c34e6f # v0.0.8
+      - uses: always-further/agent-sign@c9426f1a00f823dd53e7b9068d910a68b43e49e9 # v0.0.11

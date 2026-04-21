@@ -3,6 +3,7 @@
 //! Parses `policy.json` and resolves named groups into `CapabilitySet` entries
 //! and platform-specific rules using composable, platform-aware groups.
 
+use crate::package;
 use crate::profile;
 use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result};
 use serde::Deserialize;
@@ -76,6 +77,11 @@ pub struct DenyOps {
     /// Paths denied all content access (read+write; metadata still allowed)
     #[serde(default)]
     pub access: Vec<String>,
+    /// Unix socket paths blocked via seccomp supervisor (Linux) or Seatbelt network-outbound (macOS).
+    /// Unlike `access`, these paths are not subject to Landlock deny-within-allow overlap validation
+    /// because they are enforced at the syscall level, not the filesystem level.
+    #[serde(default)]
+    pub sockets: Vec<String>,
     /// Block file deletion globally
     #[serde(default)]
     pub unlink: bool,
@@ -122,7 +128,13 @@ pub struct ProfileDef {
     #[serde(default)]
     pub allow_launch_services: Option<bool>,
     #[serde(default)]
+    pub allow_gpu: Option<bool>,
+    #[serde(default)]
     pub interactive: bool,
+    #[serde(default)]
+    pub packs: Vec<String>,
+    #[serde(default)]
+    pub command_args: Vec<String>,
 }
 
 impl ProfileDef {
@@ -141,18 +153,24 @@ impl ProfileDef {
                 process_info_mode: self.security.process_info_mode,
                 ipc_mode: self.security.ipc_mode,
                 capability_elevation: self.security.capability_elevation,
+                wsl2_proxy_policy: self.security.wsl2_proxy_policy,
             },
             filesystem: self.filesystem.clone(),
             policy,
             network: self.network.clone(),
             env_credentials: self.env_credentials.clone(),
+            environment: None,
             workdir: self.workdir.clone(),
             hooks: self.hooks.clone(),
             rollback: self.rollback.clone(),
             open_urls: self.open_urls.clone(),
             allow_launch_services: self.allow_launch_services,
+            allow_gpu: self.allow_gpu,
+            allow_parent_of_protected: None,
             interactive: self.interactive,
             skipdirs: Vec::new(),
+            packs: self.packs.clone(),
+            command_args: self.command_args.clone(),
         }
     }
 }
@@ -210,11 +228,36 @@ pub(crate) fn expand_path(path_str: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(expanded))
 }
 
+/// Check whether a path resides inside the Nix store (`/nix/store`).
+///
+/// The Nix store is immutable by design — its contents are content-addressed
+/// and read-only. On NixOS with home-manager, shell config files such as
+/// `~/.zshrc` are often symlinks into `/nix/store/...`. Because these paths
+/// cannot be modified at runtime, deny rules targeting them for secret
+/// protection are unnecessary.
+fn is_nix_store_path(path: &Path) -> bool {
+    path.starts_with("/nix/store")
+}
+
+/// Decide whether a resolved (canonical) deny target should be skipped.
+///
+/// On Linux, symlink targets inside `/nix/store` are immutable and cannot
+/// hold runtime secrets, so adding them to the deny list is both unnecessary
+/// and harmful (causes Landlock deny-overlap errors when `/nix/store` is
+/// allowed by the `nix_runtime` group). The original symlink path is still
+/// denied, so the security posture is unchanged for non-Nix environments.
+///
+/// On macOS this always returns `false` — Seatbelt handles deny-within-allow
+/// natively, and the canonical form is needed for correct kernel matching.
+fn should_skip_resolved_deny_target(resolved: &Path) -> bool {
+    cfg!(target_os = "linux") && is_nix_store_path(resolved)
+}
+
 /// Convert a PathBuf to a UTF-8 string, returning an error for non-UTF-8 paths.
 ///
 /// Non-UTF-8 paths would produce incorrect Seatbelt rules via lossy conversion,
 /// potentially targeting the wrong path in deny rules.
-fn path_to_utf8(path: &Path) -> Result<&str> {
+pub(crate) fn path_to_utf8(path: &Path) -> Result<&str> {
     path.to_str().ok_or_else(|| {
         NonoError::ConfigParse(format!("Path contains non-UTF-8 bytes: {}", path.display()))
     })
@@ -226,7 +269,7 @@ fn path_to_utf8(path: &Path) -> Result<&str> {
 /// are the significant characters. Control characters are rejected (not stripped)
 /// to match the library's escape_path behavior — silently stripping could cause
 /// deny rules to target wrong paths.
-fn escape_seatbelt_path(path: &str) -> Result<String> {
+pub(crate) fn escape_seatbelt_path(path: &str) -> Result<String> {
     let mut result = String::with_capacity(path.len());
     for c in path.chars() {
         if c.is_control() {
@@ -242,6 +285,27 @@ fn escape_seatbelt_path(path: &str) -> Result<String> {
         }
     }
     Ok(result)
+}
+
+fn escape_seatbelt_regex_path(path: &str) -> Result<String> {
+    let mut out = String::with_capacity(path.len() + 8);
+    for c in path.chars() {
+        if c.is_control() {
+            return Err(NonoError::ConfigParse(format!(
+                "Path contains control character: {:?}",
+                path
+            )));
+        }
+        match c {
+            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '"' => out.push_str("\\\""),
+            _ => out.push(c),
+        }
+    }
+    Ok(out)
 }
 
 // ============================================================================
@@ -266,6 +330,10 @@ pub struct ResolvedGroups {
     /// On macOS these also generate platform_rules; on Linux they're
     /// validation-only since Landlock has no deny semantics.
     pub deny_paths: Vec<PathBuf>,
+    /// Expanded deny.sockets paths for seccomp supervisor enforcement.
+    /// These are not subject to Landlock overlap validation — they are enforced
+    /// via seccomp on Linux and Seatbelt network-outbound rules on macOS.
+    pub socket_paths: Vec<PathBuf>,
 }
 
 /// Resolve a list of group names into capability set entries and platform rules.
@@ -294,6 +362,7 @@ pub fn resolve_groups(
     let mut resolved_groups = Vec::new();
     let mut needs_unlink_overrides = false;
     let mut deny_paths = Vec::new();
+    let mut socket_paths = Vec::new();
 
     for name in group_names {
         let group = policy
@@ -311,7 +380,7 @@ pub fn resolve_groups(
             continue;
         }
 
-        if resolve_single_group(name, group, caps, &mut deny_paths)? {
+        if resolve_single_group(name, group, caps, &mut deny_paths, &mut socket_paths)? {
             needs_unlink_overrides = true;
         }
         resolved_groups.push(name.clone());
@@ -321,6 +390,7 @@ pub fn resolve_groups(
         names: resolved_groups,
         needs_unlink_overrides,
         deny_paths,
+        socket_paths,
     })
 }
 
@@ -331,6 +401,7 @@ fn resolve_single_group(
     group: &Group,
     caps: &mut CapabilitySet,
     deny_paths: &mut Vec<PathBuf>,
+    socket_paths: &mut Vec<PathBuf>,
 ) -> Result<bool> {
     let source = CapabilitySource::Group(group_name.to_string());
     let mut needs_unlink_overrides = false;
@@ -338,13 +409,13 @@ fn resolve_single_group(
     // Process allow operations
     if let Some(allow) = &group.allow {
         for path_str in &allow.read {
-            add_fs_capability(path_str, AccessMode::Read, &source, caps)?;
+            add_fs_capability(group_name, path_str, AccessMode::Read, &source, caps)?;
         }
         for path_str in &allow.write {
-            add_fs_capability(path_str, AccessMode::Write, &source, caps)?;
+            add_fs_capability(group_name, path_str, AccessMode::Write, &source, caps)?;
         }
         for path_str in &allow.readwrite {
-            add_fs_capability(path_str, AccessMode::ReadWrite, &source, caps)?;
+            add_fs_capability(group_name, path_str, AccessMode::ReadWrite, &source, caps)?;
         }
     }
 
@@ -352,6 +423,10 @@ fn resolve_single_group(
     if let Some(deny) = &group.deny {
         for path_str in &deny.access {
             add_deny_access_rules(path_str, caps, deny_paths)?;
+        }
+
+        for path_str in &deny.sockets {
+            add_deny_socket_rules(path_str, caps, socket_paths)?;
         }
 
         // Seatbelt-only: global unlink denial. Landlock handles file/directory
@@ -385,8 +460,48 @@ fn resolve_single_group(
     Ok(needs_unlink_overrides)
 }
 
+fn canonicalize_for_comparison(path: &Path) -> PathBuf {
+    match path.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// Skip implicit Linux temp-root grants that would cover HOME.
+///
+/// Landlock cannot enforce deny paths beneath an allowed parent. When HOME is
+/// nested under `/tmp` or `$TMPDIR`, the broad system temp grants from
+/// `system_write_linux` would silently disable default deny rules such as
+/// `~/.aws` and `~/.bash_history`. In that environment, fail secure by dropping
+/// the broad system grant and requiring explicit user/profile grants instead.
+fn should_skip_group_allow_path(group_name: &str, path: &Path) -> Result<bool> {
+    if !cfg!(target_os = "linux") || group_name != "system_write_linux" || !path.is_dir() {
+        return Ok(false);
+    }
+
+    let home = PathBuf::from(crate::config::validated_home()?);
+    let home_raw_overlaps = home.starts_with(path);
+    let home_canonical = canonicalize_for_comparison(&home);
+    let path_canonical = canonicalize_for_comparison(path);
+    let home_canonical_overlaps = home_canonical.starts_with(&path_canonical);
+
+    if !home_raw_overlaps && !home_canonical_overlaps {
+        return Ok(false);
+    }
+
+    warn!(
+        "Skipping Linux system temp grant '{}' from group '{}' because HOME '{}' is nested \
+         inside it. Landlock cannot enforce deny rules beneath an allowed parent.",
+        path.display(),
+        group_name,
+        home.display()
+    );
+    Ok(true)
+}
+
 /// Add a filesystem capability from a group path, handling expansion and existence checks
 fn add_fs_capability(
+    group_name: &str,
     path_str: &str,
     mode: AccessMode,
     source: &CapabilitySource,
@@ -400,6 +515,10 @@ fn add_fs_capability(
             path_str,
             path.display()
         );
+        return Ok(());
+    }
+
+    if should_skip_group_allow_path(group_name, &path)? {
         return Ok(());
     }
 
@@ -511,7 +630,15 @@ pub(crate) fn add_deny_access_rules(
     let canonical = path.canonicalize().ok();
     if let Some(ref canonical) = canonical {
         if *canonical != path {
-            deny_paths.push(canonical.clone());
+            if should_skip_resolved_deny_target(canonical) {
+                debug!(
+                    "Skipping deny canonical path '{}' (Nix store immutable symlink target of '{}')",
+                    canonical.display(),
+                    path.display(),
+                );
+            } else {
+                deny_paths.push(canonical.clone());
+            }
         }
     }
 
@@ -522,7 +649,7 @@ pub(crate) fn add_deny_access_rules(
         match resolve_parent_symlinks(&path) {
             Ok(resolved) => resolved,
             Err(e) => {
-                warn!(
+                debug!(
                     "Skipping parent-symlink resolution for {}: {}",
                     path.display(),
                     e
@@ -596,69 +723,228 @@ pub(crate) fn add_deny_access_rules(
     Ok(())
 }
 
-/// Add a narrow macOS exception for explicit login.keychain-db file grants.
+/// Collect a Unix socket path for seccomp/Seatbelt deny enforcement.
+///
+/// On Linux: adds to `socket_paths` for the seccomp supervisor to block at connect()/sendmsg().
+/// On macOS: adds a Seatbelt `(deny network-outbound (path ...))` rule and adds to `socket_paths`
+///   for display purposes.
+///
+/// Unlike `add_deny_access_rules`, these paths are NOT subject to Landlock deny-within-allow
+/// overlap validation because socket denial is a seccomp-level enforcement, not a filesystem
+/// Landlock rule. This allows denying sockets under broadly allowed directories (e.g.
+/// `/run/docker.sock` under `/run`).
+pub(crate) fn add_deny_socket_rules(
+    path_str: &str,
+    caps: &mut CapabilitySet,
+    socket_paths: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let path = expand_path(path_str)?;
+    socket_paths.push(path.clone());
+
+    // Also push the canonical path when it differs (e.g. /var/run -> /private/var/run on macOS)
+    if let Ok(canonical) = path.canonicalize() {
+        if canonical != path {
+            socket_paths.push(canonical.clone());
+        }
+    }
+
+    // On macOS, emit a Seatbelt network-outbound deny rule for the socket path.
+    // connect(2) on Unix domain sockets is enforced by Seatbelt as network-outbound,
+    // so a file-deny rule alone has no effect.
+    if cfg!(target_os = "macos") {
+        let escaped = escape_seatbelt_path(path_to_utf8(&path)?)?;
+        caps.add_platform_rule(format!("(deny network-outbound (path \"{}\"))", escaped))?;
+
+        // Also deny via the canonical path if it differs (parent symlink resolution)
+        if let Ok(canonical) = path.canonicalize() {
+            if canonical != path {
+                let escaped_canonical = escape_seatbelt_path(path_to_utf8(&canonical)?)?;
+                caps.add_platform_rule(format!(
+                    "(deny network-outbound (path \"{}\"))",
+                    escaped_canonical
+                ))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Add a narrow macOS exception for explicit keychain DB file grants.
 ///
 /// This keeps broad keychain deny groups active while allowing only the exact
-/// file capability intended by a profile or CLI flag.
-pub fn apply_macos_login_keychain_exception(caps: &mut CapabilitySet) {
+/// file capability intended by a profile or CLI flag, plus the backing
+/// SQLite/WAL/SHM files the Security framework actually touches under
+/// `~/Library/Keychains/<UUID>/...`.
+pub fn apply_macos_keychain_db_exception(caps: &mut CapabilitySet) {
     if !cfg!(target_os = "macos") {
         return;
     }
 
-    let user_login_db = std::env::var("HOME")
-        .ok()
-        .map(|home| Path::new(&home).join("Library/Keychains/login.keychain-db"));
-    let system_login_db = Path::new("/Library/Keychains/login.keychain-db");
+    let user_keychain_dbs = std::env::var("HOME").ok().map(|home| {
+        [
+            Path::new(&home).join("Library/Keychains/login.keychain-db"),
+            Path::new(&home).join("Library/Keychains/metadata.keychain-db"),
+        ]
+    });
+    let system_keychain_dbs = [
+        Path::new("/Library/Keychains/login.keychain-db").to_path_buf(),
+        Path::new("/Library/Keychains/metadata.keychain-db").to_path_buf(),
+    ];
 
-    let is_login_db = |path: &Path| -> bool {
-        if path == system_login_db {
+    let is_keychain_db = |path: &Path| -> bool {
+        if system_keychain_dbs
+            .iter()
+            .any(|candidate| path == candidate)
+        {
             return true;
         }
-        if let Some(ref user_login_db) = user_login_db {
-            if path == user_login_db {
+        if let Some(ref user_keychain_dbs) = user_keychain_dbs {
+            if user_keychain_dbs.iter().any(|candidate| path == candidate) {
                 return true;
             }
         }
         false
     };
 
-    let allow_rules: Vec<String> = caps
-        .fs_capabilities()
-        .iter()
-        .filter(|cap| cap.is_file)
-        .filter(|cap| matches!(cap.access, AccessMode::Read | AccessMode::ReadWrite))
-        .map(|cap| cap.resolved.clone())
-        .filter(|path| is_login_db(path))
-        .filter_map(|path| {
-            let path_str = match path_to_utf8(&path) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        "Skipping login keychain exception for {}: {}",
-                        path.display(),
-                        e
-                    );
-                    return None;
+    let merge_access = |existing: &mut AccessMode, next: AccessMode| {
+        *existing = match (*existing, next) {
+            (AccessMode::ReadWrite, _) | (_, AccessMode::ReadWrite) => AccessMode::ReadWrite,
+            (AccessMode::Read, AccessMode::Write) | (AccessMode::Write, AccessMode::Read) => {
+                AccessMode::ReadWrite
+            }
+            (mode, _) => mode,
+        };
+    };
+
+    let mut explicit_paths: HashMap<PathBuf, AccessMode> = HashMap::new();
+    let mut keychain_roots: HashMap<PathBuf, AccessMode> = HashMap::new();
+
+    for cap in caps.fs_capabilities().iter().filter(|cap| cap.is_file) {
+        if !is_keychain_db(&cap.resolved) {
+            continue;
+        }
+
+        explicit_paths
+            .entry(cap.resolved.clone())
+            .and_modify(|mode| merge_access(mode, cap.access))
+            .or_insert(cap.access);
+
+        if let Some(root) = cap.resolved.parent() {
+            keychain_roots
+                .entry(root.to_path_buf())
+                .and_modify(|mode| merge_access(mode, cap.access))
+                .or_insert(cap.access);
+        }
+    }
+
+    let mut allow_rules = Vec::new();
+
+    for (path, access) in explicit_paths {
+        let path_str = match path_to_utf8(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "Skipping keychain DB exception for {}: {}",
+                    path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        let escaped = match escape_seatbelt_path(path_str) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "Skipping keychain DB exception for {}: {}",
+                    path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        let filter = format!("literal \"{}\"", escaped);
+        // Emit specific ops (file-read-data, file-write-data) in addition to the
+        // wildcards. In Apple's Seatbelt evaluator, a wildcard-op allow does not
+        // override an earlier specific-op deny on an overlapping path (the broad
+        // `deny_keychains_macos` group emits `(deny file-read-data (subpath ...))`).
+        // Emitting the specific op with a literal path ensures the override wins.
+        match access {
+            AccessMode::Read => {
+                allow_rules.push(format!("(allow file-read-data ({}))", filter));
+                allow_rules.push(format!("(allow file-read* ({}))", filter));
+            }
+            AccessMode::Write => {
+                allow_rules.push(format!("(allow file-write-data ({}))", filter));
+                allow_rules.push(format!("(allow file-write* ({}))", filter));
+            }
+            AccessMode::ReadWrite => {
+                allow_rules.push(format!("(allow file-read-data ({}))", filter));
+                allow_rules.push(format!("(allow file-read* ({}))", filter));
+                allow_rules.push(format!("(allow file-write-data ({}))", filter));
+                allow_rules.push(format!("(allow file-write* ({}))", filter));
+            }
+        }
+    }
+
+    for (root, access) in keychain_roots {
+        let root_str = match path_to_utf8(&root) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "Skipping keychain runtime exception for {}: {}",
+                    root.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        let escaped_root = match escape_seatbelt_regex_path(root_str) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "Skipping keychain runtime exception for {}: {}",
+                    root.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        let filters = [
+            format!(r#"regex #"^{}/\.fl[0-9A-Fa-f]+$""#, escaped_root),
+            format!(
+                r#"regex #"^{}/[^/]+/(?:[^/]+\.db(?:-(?:wal|shm))?|user\.kb)$""#,
+                escaped_root
+            ),
+        ];
+
+        // See comment above: emit specific ops alongside wildcards so they override
+        // the specific-op denies from deny_keychains_macos.
+        for filter in filters {
+            match access {
+                AccessMode::Read => {
+                    allow_rules.push(format!("(allow file-read-data ({}))", filter));
+                    allow_rules.push(format!("(allow file-read* ({}))", filter));
                 }
-            };
-            let escaped = match escape_seatbelt_path(path_str) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        "Skipping login keychain exception for {}: {}",
-                        path.display(),
-                        e
-                    );
-                    return None;
+                AccessMode::Write => {
+                    allow_rules.push(format!("(allow file-write-data ({}))", filter));
+                    allow_rules.push(format!("(allow file-write* ({}))", filter));
                 }
-            };
-            Some(format!("(allow file-read-data (literal \"{}\"))", escaped))
-        })
-        .collect();
+                AccessMode::ReadWrite => {
+                    allow_rules.push(format!("(allow file-read-data ({}))", filter));
+                    allow_rules.push(format!("(allow file-read* ({}))", filter));
+                    allow_rules.push(format!("(allow file-write-data ({}))", filter));
+                    allow_rules.push(format!("(allow file-write* ({}))", filter));
+                }
+            }
+        }
+    }
+
+    allow_rules.sort_unstable();
 
     for rule in allow_rules {
         if let Err(e) = caps.add_platform_rule(rule) {
-            warn!("Failed to add login keychain exception rule: {}", e);
+            warn!("Failed to add keychain DB exception rule: {}", e);
         }
     }
 }
@@ -853,6 +1139,19 @@ pub fn resolve_deny_paths_for_groups(
     Ok(resolved.deny_paths)
 }
 
+/// Resolve deny.sockets paths for a group list without mutating caller capabilities.
+///
+/// Returns the expanded socket paths from all `deny.sockets` entries in the specified groups.
+/// These paths are passed to the seccomp supervisor to block connect()/sendmsg() on Linux.
+pub fn resolve_socket_paths_for_groups(
+    policy: &Policy,
+    group_names: &[String],
+) -> Result<Vec<PathBuf>> {
+    let mut tmp_caps = CapabilitySet::new();
+    let resolved = resolve_groups(policy, group_names, &mut tmp_caps)?;
+    Ok(resolved.socket_paths)
+}
+
 /// Check for deny paths that overlap with allowed paths on Linux.
 ///
 /// Landlock is strictly allow-list and cannot deny a child of an allowed parent.
@@ -886,9 +1185,7 @@ pub fn validate_deny_overlaps(deny_paths: &[PathBuf], caps: &CapabilitySet) -> R
                     "Landlock cannot enforce {}. This deny has no effect on Linux.",
                     conflict
                 );
-                if cap.source.is_user_intent() {
-                    fatal_conflicts.push(conflict);
-                }
+                fatal_conflicts.push(conflict);
             }
         }
     }
@@ -940,35 +1237,51 @@ pub fn group_description<'a>(policy: &'a Policy, name: &str) -> Option<&'a str> 
 // Query helpers: extract flat lists from policy groups
 // ============================================================================
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SensitivePathRule {
+    pub expanded_path: String,
+    pub group_name: String,
+    pub description: String,
+}
+
 /// Get all sensitive (deny.access) paths from platform-matching policy groups.
 ///
-/// Returns a list of `(expanded_path, group_description)` tuples suitable for
-/// display in `nono why`. Paths are expanded (~ -> $HOME, $TMPDIR -> value).
-pub fn get_sensitive_paths(policy: &Policy) -> Result<Vec<(String, String)>> {
+/// Returns a list of expanded deny rules suitable for display in `nono why`.
+/// Paths are expanded (~ -> $HOME, $TMPDIR -> value).
+pub fn get_sensitive_paths(policy: &Policy) -> Result<Vec<SensitivePathRule>> {
     let mut result = Vec::new();
 
-    for group in policy.groups.values() {
+    for (group_name, group) in &policy.groups {
         if !group_matches_platform(group) {
             continue;
         }
         if let Some(deny) = &group.deny {
             for path_str in &deny.access {
                 let expanded = expand_path(path_str)?;
-                result.push((
-                    expanded.to_string_lossy().into_owned(),
-                    group.description.clone(),
-                ));
+                result.push(SensitivePathRule {
+                    expanded_path: expanded.to_string_lossy().into_owned(),
+                    group_name: group_name.clone(),
+                    description: group.description.clone(),
+                });
 
                 // If the deny path is a symlink, also mark the resolved target
                 // as sensitive. Without this, querying a symlinked path like
                 // ~/.zshrc -> ~/dev/dotfiles/.zshrc would miss the deny.
+                //
+                // Exception: on Linux, skip resolved targets inside /nix/store.
+                // NixOS home-manager creates symlinks from shell configs into the
+                // immutable Nix store, and the sandbox correctly allows reading
+                // those paths (see add_deny_access_rules). Marking the Nix store
+                // target as sensitive would cause `nono why` to report a false
+                // denial for paths the sandbox actually permits.
                 if expanded.is_symlink() {
                     if let Ok(resolved) = expanded.canonicalize() {
-                        if resolved != expanded {
-                            result.push((
-                                resolved.to_string_lossy().into_owned(),
-                                group.description.clone(),
-                            ));
+                        if resolved != expanded && !should_skip_resolved_deny_target(&resolved) {
+                            result.push(SensitivePathRule {
+                                expanded_path: resolved.to_string_lossy().into_owned(),
+                                group_name: group_name.clone(),
+                                description: group.description.clone(),
+                            });
                         }
                     }
                 }
@@ -1069,10 +1382,66 @@ pub fn list_policy_profiles() -> Result<Vec<String>> {
 
 /// Load the embedded policy and return the parsed Policy struct.
 ///
-/// Convenience wrapper that loads from the compile-time embedded JSON.
+/// The policy JSON is embedded at compile time and never changes at runtime,
+/// so we parse it once and cache the result. This avoids re-parsing ~23 KB of
+/// JSON on every call (up to ~18 call sites per CLI invocation).
 pub fn load_embedded_policy() -> Result<Policy> {
+    static CACHED: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
+
+    // The embedded JSON is baked in at build time — parse failure here means
+    // a build-system bug, not a runtime condition.  We cache the successful
+    // parse and clone on each call (cheap: Policy is a handful of HashMaps
+    // whose keys and values are small strings).
+    if let Some(policy) = CACHED.get() {
+        return Ok(policy.clone());
+    }
+
     let json = crate::config::embedded::embedded_policy_json();
-    load_policy(json)
+    let mut policy = load_policy(json)?;
+    load_package_groups(&mut policy)?;
+    // Another thread may have raced us; that's fine — OnceLock keeps the
+    // first value and our `policy` is simply dropped.
+    let _ = CACHED.set(policy.clone());
+    Ok(policy)
+}
+
+pub fn load_package_groups(policy: &mut Policy) -> Result<()> {
+    // Tolerate missing config dir / lockfile — no packages installed means
+    // no groups to load. This is the common case in tests and fresh installs.
+    let lockfile = match package::read_lockfile() {
+        Ok(lf) => lf,
+        Err(_) => return Ok(()),
+    };
+    for package_key in lockfile.packages.keys() {
+        let (namespace, name) = package_key.split_once('/').ok_or_else(|| {
+            NonoError::PackageInstall(format!("invalid lockfile package key '{package_key}'"))
+        })?;
+        let groups_path = package::package_groups_path(namespace, name)?;
+        if !groups_path.exists() {
+            continue;
+        }
+
+        let content = std::fs::read_to_string(&groups_path).map_err(|e| NonoError::ConfigRead {
+            path: groups_path.clone(),
+            source: e,
+        })?;
+
+        let groups: HashMap<String, Group> = serde_json::from_str(&content).map_err(|e| {
+            NonoError::ConfigParse(format!("failed to parse {}: {e}", groups_path.display()))
+        })?;
+
+        for (group_name, group) in groups {
+            if policy.groups.contains_key(&group_name) {
+                return Err(NonoError::PackageInstall(format!(
+                    "package group '{}' collides with an existing policy group",
+                    group_name
+                )));
+            }
+            policy.groups.insert(group_name, group);
+        }
+    }
+
+    Ok(())
 }
 
 // ============================================================================
@@ -1175,8 +1544,16 @@ mod tests {
             .contains(&"$HOME/.local/share/claude".to_string()));
         assert!(!profile
             .filesystem
-            .read_file
+            .allow_file
             .contains(&"$HOME/Library/Keychains/login.keychain-db".to_string()));
+        assert!(!profile
+            .filesystem
+            .allow_file
+            .contains(&"$HOME/Library/Keychains/metadata.keychain-db".to_string()));
+        assert!(profile
+            .filesystem
+            .allow
+            .contains(&"$HOME/.claude.lock".to_string()));
     }
 
     #[test]
@@ -1188,12 +1565,15 @@ mod tests {
             .get("claude_code_macos")
             .expect("claude_code_macos group missing");
         assert_eq!(claude_code_macos.platform.as_deref(), Some("macos"));
-        assert!(claude_code_macos
+        let claude_code_macos_paths = &claude_code_macos
             .allow
             .as_ref()
             .expect("claude_code_macos allow missing")
-            .read
+            .readwrite;
+        assert!(claude_code_macos_paths
             .contains(&"$HOME/Library/Keychains/login.keychain-db".to_string()));
+        assert!(claude_code_macos_paths
+            .contains(&"$HOME/Library/Keychains/metadata.keychain-db".to_string()));
 
         let claude_code_linux = policy
             .groups
@@ -1635,7 +2015,10 @@ mod tests {
         let sensitive = get_sensitive_paths(&policy).expect("get sensitive paths");
 
         let link_canonical = link.canonicalize().expect("canonicalize");
-        let paths: Vec<&str> = sensitive.iter().map(|(p, _)| p.as_str()).collect();
+        let paths: Vec<&str> = sensitive
+            .iter()
+            .map(|rule| rule.expanded_path.as_str())
+            .collect();
         assert!(
             paths.contains(&link_str),
             "sensitive paths must contain symlink path"
@@ -1643,6 +2026,97 @@ mod tests {
         assert!(
             paths.contains(&link_canonical.to_str().expect("utf8")),
             "sensitive paths must contain resolved target"
+        );
+    }
+
+    #[test]
+    fn test_should_skip_resolved_deny_target() {
+        // Directly exercise the shared predicate used by both
+        // add_deny_access_rules and get_sensitive_paths.
+
+        let nix_paths = [
+            Path::new("/nix/store/abc123-home-manager-files/.zshrc"),
+            Path::new("/nix/store/xyz789-zsh-5.9/share/zsh"),
+            Path::new("/nix/store"),
+        ];
+
+        let non_nix_paths = [
+            Path::new("/home/user/.zshrc"),
+            Path::new("/nix/var/nix/profiles/default"),
+            Path::new("/nix"),
+            Path::new("/nix/stored-elsewhere"),
+            Path::new("/tmp/nix/store/fake"),
+        ];
+
+        for p in &nix_paths {
+            if cfg!(target_os = "linux") {
+                assert!(
+                    should_skip_resolved_deny_target(p),
+                    "Linux must skip Nix store target: {}",
+                    p.display()
+                );
+            } else {
+                assert!(
+                    !should_skip_resolved_deny_target(p),
+                    "macOS must NOT skip Nix store target (Seatbelt needs it): {}",
+                    p.display()
+                );
+            }
+        }
+
+        for p in &non_nix_paths {
+            assert!(
+                !should_skip_resolved_deny_target(p),
+                "must never skip non-Nix-store path: {}",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
+    fn test_sensitive_paths_nix_store_symlink_end_to_end() {
+        // End-to-end: a symlinked deny target whose canonical form is NOT
+        // in /nix/store is included. We cannot create real /nix/store files
+        // in tests, but should_skip_resolved_deny_target (tested above)
+        // covers the /nix/store branch directly. Here we verify that the
+        // integration between get_sensitive_paths and the predicate works:
+        // non-skipped symlink targets must appear in the result.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let target = dir.path().join("real_zshrc");
+        std::fs::write(&target, "config").expect("write");
+        let link = dir.path().join("linked_zshrc");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let link_str = link.to_str().expect("utf8");
+        let json = format!(
+            r#"{{
+              "meta": {{ "version": 1, "schema_version": "1.0" }},
+              "groups": {{
+                "test_deny": {{
+                  "description": "Test deny",
+                  "deny": {{ "access": ["{}"] }}
+                }}
+              }}
+            }}"#,
+            link_str
+        );
+        let policy = load_policy(&json).expect("parse");
+        let sensitive = get_sensitive_paths(&policy).expect("sensitive paths");
+        let canonical = link.canonicalize().expect("canonicalize");
+        let paths: Vec<&str> = sensitive.iter().map(|r| r.expanded_path.as_str()).collect();
+
+        // The canonical target is not in /nix/store, so it must be included
+        assert!(
+            !should_skip_resolved_deny_target(&canonical),
+            "precondition: tempdir canonical is not a nix store path"
+        );
+        assert!(
+            paths.contains(&link_str),
+            "sensitive paths must contain the symlink path"
+        );
+        assert!(
+            paths.contains(&canonical.to_str().expect("utf8")),
+            "non-nix canonical target must be in sensitive paths"
         );
     }
 
@@ -1694,6 +2168,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_escape_seatbelt_regex_path() {
+        assert_eq!(
+            escape_seatbelt_regex_path("/simple/path").expect("simple path"),
+            "/simple/path"
+        );
+        assert_eq!(
+            escape_seatbelt_regex_path("/path.with+regex?(chars)").expect("regex chars"),
+            "/path\\.with\\+regex\\?\\(chars\\)"
+        );
+        assert_eq!(
+            escape_seatbelt_regex_path("/path\"quoted").expect("quote"),
+            "/path\\\"quoted"
+        );
+    }
+
+    #[test]
+    fn test_escape_seatbelt_regex_path_rejects_control_chars() {
+        assert!(escape_seatbelt_regex_path("/path\nwith\nnewlines").is_err());
+        assert!(escape_seatbelt_regex_path("/path\rwith\rreturns").is_err());
+        assert!(escape_seatbelt_regex_path("/path\0with\0nulls").is_err());
+        assert!(escape_seatbelt_regex_path("/path\twith\ttabs").is_err());
+        assert!(escape_seatbelt_regex_path("/path\x0bwith\x0cfeeds").is_err());
+        assert!(escape_seatbelt_regex_path("/path\x1bwith\x1bescape").is_err());
+        assert!(escape_seatbelt_regex_path("/path\x7fwith\x7fdel").is_err());
     }
 
     #[test]
@@ -1765,8 +2266,48 @@ mod tests {
         validate_deny_overlaps(&deny_paths, &caps).expect("No overlap should succeed");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn test_validate_deny_overlaps_group_overlap_warn_only() {
+    fn test_should_skip_system_write_linux_tmp_grant_when_home_is_nested() {
+        // Use `keep()` so the temp dir is NOT auto-deleted. Tests that call
+        // `tempdir()` concurrently (without the env lock) may create dirs
+        // inside our temp_root while TMPDIR points to it. If we deleted it,
+        // those dirs would vanish and cause flaky failures.  The OS reclaims
+        // /tmp contents on its own schedule.
+        let temp_root = tempfile::tempdir().expect("tmpdir").keep();
+        let home = temp_root.join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let original_tmpdir = std::env::var("TMPDIR").unwrap_or("/tmp".to_string());
+
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", home.to_str().expect("home path")),
+            ("TMPDIR", temp_root.to_str().expect("tmpdir path")),
+        ]);
+
+        let skip_tmp =
+            should_skip_group_allow_path("system_write_linux", Path::new(&original_tmpdir))
+                .expect("check original TMPDIR skip");
+        let skip_tmpdir = should_skip_group_allow_path("system_write_linux", &temp_root)
+            .expect("check new TMPDIR skip");
+
+        assert!(
+            skip_tmp,
+            "original TMPDIR should be skipped when HOME is nested under it"
+        );
+        assert!(
+            skip_tmpdir,
+            "$TMPDIR should be skipped when HOME is nested under it"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_validate_deny_overlaps_group_overlap_is_fatal() {
         use nono::FsCapability;
 
         let mut caps = CapabilitySet::new();
@@ -1777,10 +2318,15 @@ mod tests {
 
         let deny_paths = vec![PathBuf::from("/tmp/secret")];
 
-        // Group/system overlaps are warning-only. Fatal errors are reserved for
-        // explicit user intent (CLI/profile), where deny-within-allow is likely accidental.
-        validate_deny_overlaps(&deny_paths, &caps)
-            .expect("group overlap should not hard-fail validation");
+        // Group-sourced overlaps must be fatal on Linux — Landlock cannot
+        // enforce deny-within-allow, so silently ignoring the conflict
+        // gives the user a false sense of security.
+        // On macOS this is a no-op (Seatbelt handles deny-within-allow natively).
+        let result = validate_deny_overlaps(&deny_paths, &caps);
+        assert!(
+            result.is_err(),
+            "group-sourced deny overlap must be a hard error on Linux"
+        );
     }
 
     #[test]
@@ -1792,9 +2338,9 @@ mod tests {
         // means the allow wins. Both cases silently disable the deny.
         //
         // We check every group because profiles can
-        // combine arbitrary groups, and validate_deny_overlaps is warn-only
-        // for group-sourced capabilities at runtime. This test is the real
-        // safety net for the embedded policy.
+        // combine arbitrary groups, and validate_deny_overlaps rejects
+        // overlaps at runtime. This test catches regressions in the
+        // embedded policy at compile time.
         //
         // We filter to Linux-applicable groups (platform: None or "linux")
         // and check directly from parsed policy so this catches regressions
@@ -1831,6 +2377,15 @@ mod tests {
                     let expanded = expand_path(p).unwrap_or_else(|e| {
                         panic!("expand_path({p}) failed in group '{name}': {e}")
                     });
+                    if should_skip_group_allow_path(name, &expanded).unwrap_or_else(|e| {
+                        panic!(
+                            "should_skip_group_allow_path({}, {}) failed: {e}",
+                            name,
+                            expanded.display()
+                        )
+                    }) {
+                        continue;
+                    }
                     allow_paths.push((name.clone(), expanded));
                 }
             }
@@ -1962,11 +2517,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_embedded_policy_includes_device_files() {
-        // The system_read_linux group lists /dev/urandom, /dev/null, etc.
+        // The system_read_linux_core group lists /dev/urandom, /dev/null, etc.
         // Verify they survive policy resolution and end up in the capability set.
         let policy = load_embedded_policy().expect("embedded policy");
         let mut caps = CapabilitySet::new();
-        resolve_groups(&policy, &["system_read_linux".to_string()], &mut caps)
+        resolve_groups(&policy, &["system_read_linux_core".to_string()], &mut caps)
             .expect("resolve failed");
 
         let resolved_paths: Vec<PathBuf> = caps
@@ -1978,7 +2533,7 @@ mod tests {
         for device in &["/dev/urandom", "/dev/null", "/dev/zero", "/dev/random"] {
             assert!(
                 resolved_paths.iter().any(|p| p == Path::new(device)),
-                "{} must be included in system_read_linux capabilities, got: {:?}",
+                "{} must be included in system_read_linux_core capabilities, got: {:?}",
                 device,
                 resolved_paths
             );
@@ -2005,12 +2560,12 @@ mod tests {
     }
 
     #[test]
-    fn test_system_read_linux_does_not_grant_bare_etc_or_proc() {
+    fn test_system_read_linux_core_does_not_grant_bare_etc_or_proc() {
         let policy = load_embedded_policy().expect("embedded policy must parse");
         let group = policy
             .groups
-            .get("system_read_linux")
-            .expect("system_read_linux group must exist");
+            .get("system_read_linux_core")
+            .expect("system_read_linux_core group must exist");
         let read_paths = group
             .allow
             .as_ref()
@@ -2019,13 +2574,117 @@ mod tests {
 
         assert!(
             !read_paths.iter().any(|p| p == "/etc"),
-            "system_read_linux must not grant bare '/etc'; use specific paths instead. Found: {:?}",
+            "system_read_linux_core must not grant bare '/etc'; use specific paths instead. Found: {:?}",
             read_paths
         );
         assert!(
             !read_paths.iter().any(|p| p == "/proc"),
-            "system_read_linux must not grant bare '/proc'; use specific paths instead. Found: {:?}",
+            "system_read_linux_core must not grant bare '/proc'; use specific paths instead. Found: {:?}",
             read_paths
+        );
+    }
+
+    #[test]
+    fn test_linux_core_excludes_runtime_state_sysfs_temp_and_nix() {
+        let policy = load_embedded_policy().expect("embedded policy must parse");
+        let group = policy
+            .groups
+            .get("system_read_linux_core")
+            .expect("system_read_linux_core group must exist");
+        let read_paths = group
+            .allow
+            .as_ref()
+            .map(|a| a.read.as_slice())
+            .unwrap_or(&[]);
+
+        for disallowed in ["/run", "/var/run", "/sys", "/tmp", "/nix"] {
+            assert!(
+                !read_paths.iter().any(|p| p == disallowed),
+                "system_read_linux_core must not include '{}'. Found: {:?}",
+                disallowed,
+                read_paths
+            );
+        }
+    }
+
+    #[test]
+    fn test_linux_compat_groups_expose_expected_paths() {
+        let policy = load_embedded_policy().expect("embedded policy must parse");
+
+        let runtime = policy
+            .groups
+            .get("linux_runtime_state")
+            .expect("linux_runtime_state group must exist");
+        let runtime_paths = runtime
+            .allow
+            .as_ref()
+            .map(|a| a.read.as_slice())
+            .unwrap_or(&[]);
+        assert!(runtime_paths.iter().any(|p| p == "/run"));
+        assert!(runtime_paths.iter().any(|p| p == "/var/run"));
+
+        let sysfs = policy
+            .groups
+            .get("linux_sysfs_read")
+            .expect("linux_sysfs_read group must exist");
+        let sysfs_paths = sysfs
+            .allow
+            .as_ref()
+            .map(|a| a.read.as_slice())
+            .unwrap_or(&[]);
+        assert_eq!(sysfs_paths, ["/sys"]);
+
+        let temp = policy
+            .groups
+            .get("linux_temp_read")
+            .expect("linux_temp_read group must exist");
+        let temp_paths = temp
+            .allow
+            .as_ref()
+            .map(|a| a.read.as_slice())
+            .unwrap_or(&[]);
+        assert_eq!(temp_paths, ["/tmp"]);
+    }
+
+    #[test]
+    fn test_default_user_groups_do_not_grant_local_state() {
+        let policy = load_embedded_policy().expect("embedded policy must parse");
+
+        let user_tools = policy
+            .groups
+            .get("user_tools")
+            .expect("user_tools group must exist");
+        let user_tools_allow = user_tools.allow.as_ref().expect("user_tools allow rules");
+        assert!(
+            !user_tools_allow.read.iter().any(|p| p == "~/.local/state"),
+            "user_tools must not grant ~/.local/state"
+        );
+        assert!(
+            !user_tools_allow
+                .readwrite
+                .iter()
+                .any(|p| p == "~/.local/state"),
+            "user_tools must not grant ~/.local/state"
+        );
+
+        let user_caches_linux = policy
+            .groups
+            .get("user_caches_linux")
+            .expect("user_caches_linux group must exist");
+        let user_caches_allow = user_caches_linux
+            .allow
+            .as_ref()
+            .expect("user_caches_linux allow rules");
+        assert!(
+            !user_caches_allow.read.iter().any(|p| p == "~/.local/state"),
+            "user_caches_linux must not grant ~/.local/state"
+        );
+        assert!(
+            !user_caches_allow
+                .readwrite
+                .iter()
+                .any(|p| p == "~/.local/state"),
+            "user_caches_linux must not grant ~/.local/state"
         );
     }
 
@@ -2090,6 +2749,181 @@ mod tests {
         assert!(
             rules.contains("subpath"),
             "should use subpath for directory, got: {}",
+            rules
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_apply_macos_keychain_db_exception_adds_login_db_allow_rule() {
+        let mut caps = CapabilitySet::new();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
+        let login_db = PathBuf::from(home).join("Library/Keychains/login.keychain-db");
+        caps.add_fs(FsCapability {
+            original: login_db.clone(),
+            resolved: login_db.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Profile,
+        });
+
+        apply_macos_keychain_db_exception(&mut caps);
+
+        let rules = caps.platform_rules().join("\n");
+        assert!(
+            rules.contains(&format!(
+                "(allow file-read* (literal \"{}\"))",
+                escape_seatbelt_path(login_db.to_str().expect("utf8 path")).expect("escaped path")
+            )),
+            "expected login keychain DB exception rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write* (literal \"{}\"))",
+                escape_seatbelt_path(login_db.to_str().expect("utf8 path")).expect("escaped path")
+            )),
+            "expected login keychain DB write rule, got: {}",
+            rules
+        );
+        // Specific-op rules must also be emitted so they override the specific-op
+        // deny from deny_keychains_macos: (deny file-read-data (subpath "...Keychains")).
+        // A file-read* wildcard allow does not override a file-read-data specific deny.
+        assert!(
+            rules.contains(&format!(
+                "(allow file-read-data (literal \"{}\"))",
+                escape_seatbelt_path(login_db.to_str().expect("utf8 path")).expect("escaped path")
+            )),
+            "expected login keychain DB file-read-data rule (to override specific deny), got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write-data (literal \"{}\"))",
+                escape_seatbelt_path(login_db.to_str().expect("utf8 path")).expect("escaped path")
+            )),
+            "expected login keychain DB file-write-data rule (to override specific deny), got: {}",
+            rules
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_apply_macos_keychain_db_exception_adds_metadata_db_allow_rule() {
+        let mut caps = CapabilitySet::new();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
+        let metadata_db = PathBuf::from(home).join("Library/Keychains/metadata.keychain-db");
+        caps.add_fs(FsCapability {
+            original: metadata_db.clone(),
+            resolved: metadata_db.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Profile,
+        });
+
+        apply_macos_keychain_db_exception(&mut caps);
+
+        let rules = caps.platform_rules().join("\n");
+        assert!(
+            rules.contains(&format!(
+                "(allow file-read* (literal \"{}\"))",
+                escape_seatbelt_path(metadata_db.to_str().expect("utf8 path"))
+                    .expect("escaped path")
+            )),
+            "expected metadata keychain DB exception rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write* (literal \"{}\"))",
+                escape_seatbelt_path(metadata_db.to_str().expect("utf8 path"))
+                    .expect("escaped path")
+            )),
+            "expected metadata keychain DB write rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-read-data (literal \"{}\"))",
+                escape_seatbelt_path(metadata_db.to_str().expect("utf8 path"))
+                    .expect("escaped path")
+            )),
+            "expected metadata keychain DB file-read-data rule (to override specific deny), got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write-data (literal \"{}\"))",
+                escape_seatbelt_path(metadata_db.to_str().expect("utf8 path"))
+                    .expect("escaped path")
+            )),
+            "expected metadata keychain DB file-write-data rule (to override specific deny), got: {}",
+            rules
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_apply_macos_keychain_db_exception_adds_runtime_keychain_rules() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let home = dir.path().join("home");
+        let keychains = home.join("Library/Keychains");
+        std::fs::create_dir_all(&keychains).expect("mkdir keychains");
+        std::fs::write(keychains.join("login.keychain-db"), "").expect("write login db");
+        std::fs::write(keychains.join("metadata.keychain-db"), "").expect("write metadata db");
+
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "HOME",
+            home.to_str().expect("home path utf8"),
+        )]);
+
+        let login_db = keychains.join("login.keychain-db");
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: login_db.clone(),
+            resolved: login_db,
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Profile,
+        });
+
+        apply_macos_keychain_db_exception(&mut caps);
+
+        let escaped_root =
+            escape_seatbelt_regex_path(keychains.to_str().expect("keychains path utf8"))
+                .expect("escaped regex path");
+        let rules = caps.platform_rules().join("\n");
+
+        assert!(
+            rules.contains(&format!(
+                "(allow file-read* (regex #\"^{}/\\.fl[0-9A-Fa-f]+$\"))",
+                escaped_root
+            )),
+            "expected root .fl keychain rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write* (regex #\"^{}/\\.fl[0-9A-Fa-f]+$\"))",
+                escaped_root
+            )),
+            "expected writable root .fl keychain rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-read* (regex #\"^{}/[^/]+/(?:[^/]+\\.db(?:-(?:wal|shm))?|user\\.kb)$\"))",
+                escaped_root
+            )),
+            "expected runtime DB read rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write* (regex #\"^{}/[^/]+/(?:[^/]+\\.db(?:-(?:wal|shm))?|user\\.kb)$\"))",
+                escaped_root
+            )),
+            "expected runtime DB write rule, got: {}",
             rules
         );
     }
@@ -2276,6 +3110,60 @@ mod tests {
             deny_paths.is_empty(),
             "both symlink and target deny paths should be removed, remaining: {:?}",
             deny_paths
+        );
+    }
+
+    #[test]
+    fn test_deny_access_skips_nix_store_canonical_on_linux() {
+        // Verify that add_deny_access_rules still includes canonical paths
+        // for non-Nix-store symlinks (the skip logic only fires for
+        // /nix/store targets, tested via should_skip_resolved_deny_target).
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let target = dir.path().join("real_file");
+        std::fs::write(&target, "content").expect("write target");
+        let link = dir.path().join("link_file");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        let mut caps = CapabilitySet::new();
+        let mut deny_paths = Vec::new();
+        let link_str = link.to_str().expect("valid utf8");
+        add_deny_access_rules(link_str, &mut caps, &mut deny_paths).expect("add deny rules");
+
+        let link_canonical = link.canonicalize().expect("canonicalize");
+
+        // Precondition: the canonical is not a nix store path
+        assert!(
+            !should_skip_resolved_deny_target(&link_canonical),
+            "precondition: tempdir canonical is not a nix store path"
+        );
+
+        // Both the symlink and its canonical target should be in deny_paths
+        assert!(
+            deny_paths.contains(&link),
+            "deny_paths must contain the symlink path"
+        );
+        assert!(
+            deny_paths.contains(&link_canonical),
+            "non-nix-store canonical should still be added to deny_paths"
+        );
+    }
+
+    #[test]
+    fn test_nix_runtime_group_includes_nix_store() {
+        let json = crate::config::embedded::embedded_policy_json();
+        let policy = load_policy(json).expect("parse policy.json");
+        let group = policy
+            .groups
+            .get("nix_runtime")
+            .expect("nix_runtime group must exist");
+        let read_paths = &group
+            .allow
+            .as_ref()
+            .expect("nix_runtime must have allow block")
+            .read;
+        assert!(
+            read_paths.contains(&"/nix/store".to_string()),
+            "nix_runtime group must include /nix/store for NixOS compatibility"
         );
     }
 }

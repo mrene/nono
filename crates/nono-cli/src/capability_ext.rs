@@ -29,12 +29,197 @@ fn try_new_dir(path: &Path, access: AccessMode, label: &str) -> Result<Option<Fs
 fn try_new_file(path: &Path, access: AccessMode, label: &str) -> Result<Option<FsCapability>> {
     match FsCapability::new_file(path, access) {
         Ok(cap) => Ok(Some(cap)),
-        Err(NonoError::PathNotFound(_)) => {
-            warn!("{}: {}", label, path.display());
-            Ok(None)
-        }
+        Err(NonoError::PathNotFound(_)) => handle_missing_file_capability(path, access, label),
         Err(e) => Err(e),
     }
+}
+
+/// Create a profile capability for an exact path that is usually expected to be a file.
+///
+/// Some clients use lock directories at paths that historically held lock files
+/// (for example `~/.claude.lock`). On macOS we can preserve exact-path semantics
+/// for that directory by emitting a literal path rule instead of widening to a
+/// recursive directory grant. On other platforms, fail closed.
+fn try_new_profile_exact_path(
+    path: &Path,
+    access: AccessMode,
+    label: &str,
+    protected_roots: &ProtectedRoots,
+    allow_parent_of_protected: bool,
+) -> Result<Option<FsCapability>> {
+    validate_requested_file(path, "Profile", protected_roots, allow_parent_of_protected)?;
+    match try_new_file(path, access, label) {
+        Err(NonoError::ExpectedFile(_)) => {
+            handle_exact_directory_path(path, access, protected_roots, allow_parent_of_protected)
+        }
+        result => result,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn handle_exact_directory_path(
+    path: &Path,
+    access: AccessMode,
+    protected_roots: &ProtectedRoots,
+    allow_parent_of_protected: bool,
+) -> Result<Option<FsCapability>> {
+    validate_requested_dir(path, "Profile", protected_roots, allow_parent_of_protected)?;
+    let resolved = path.canonicalize().map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            NonoError::PathNotFound(path.to_path_buf())
+        } else {
+            NonoError::PathCanonicalization {
+                path: path.to_path_buf(),
+                source,
+            }
+        }
+    })?;
+
+    debug!(
+        "Profile exact-file path resolved as directory; granting exact macOS literal path access: {}",
+        path.display()
+    );
+
+    Ok(Some(FsCapability {
+        original: path.to_path_buf(),
+        resolved,
+        access,
+        // On macOS, `is_file = true` makes Seatbelt emit a literal path rule
+        // rather than a recursive subpath rule. The target may still be a
+        // directory; the important property is exact-path matching.
+        is_file: true,
+        source: CapabilitySource::Profile,
+    }))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn handle_exact_directory_path(
+    path: &Path,
+    _access: AccessMode,
+    _protected_roots: &ProtectedRoots,
+    _allow_parent_of_protected: bool,
+) -> Result<Option<FsCapability>> {
+    Err(NonoError::ExpectedFile(path.to_path_buf()))
+}
+
+#[cfg(target_os = "macos")]
+fn handle_missing_file_capability(
+    path: &Path,
+    access: AccessMode,
+    _label: &str,
+) -> Result<Option<FsCapability>> {
+    let cap = new_future_file_capability(path, access)?;
+    debug!(
+        "Granting future exact file capability on macOS for missing path: {}",
+        path.display()
+    );
+    Ok(Some(cap))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn handle_missing_file_capability(
+    path: &Path,
+    _access: AccessMode,
+    label: &str,
+) -> Result<Option<FsCapability>> {
+    warn!("{}: {}", label, path.display());
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn new_future_file_capability(path: &Path, access: AccessMode) -> Result<FsCapability> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(NonoError::Io)?.join(path)
+    };
+
+    Ok(FsCapability {
+        original: path.to_path_buf(),
+        resolved: resolve_missing_leaf_path(&absolute)?,
+        access,
+        is_file: true,
+        source: CapabilitySource::User,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_missing_leaf_path(path: &Path) -> Result<PathBuf> {
+    for ancestor in path.ancestors() {
+        match ancestor.canonicalize() {
+            Ok(mut canonical) => {
+                if let Ok(relative) = path.strip_prefix(ancestor) {
+                    canonical.push(relative);
+                }
+                return Ok(canonical);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(NonoError::PathCanonicalization {
+                    path: path.to_path_buf(),
+                    source: err,
+                });
+            }
+        }
+    }
+
+    Err(NonoError::PathNotFound(path.to_path_buf()))
+}
+
+/// Add a platform rule to allow atomic-write temp files for a writable file.
+///
+/// Many tools (e.g. Claude Code) write atomically by creating a temp file
+/// (`file.tmp.PID.TIMESTAMP`) then renaming it over the target. This function
+/// adds a Seatbelt regex rule to permit creating/writing those temp files
+/// alongside the allowed file.
+#[cfg(target_os = "macos")]
+fn add_atomic_write_rule(caps: &mut CapabilitySet, cap: &FsCapability) -> Result<()> {
+    if !matches!(cap.access, AccessMode::Write | AccessMode::ReadWrite) {
+        return Ok(());
+    }
+
+    fn add_rule_for_path(caps: &mut CapabilitySet, path: &Path) -> Result<()> {
+        let path_str = path.to_str().ok_or_else(|| {
+            NonoError::SandboxInit(format!(
+                "non-UTF-8 path for atomic write rule: {}",
+                path.display()
+            ))
+        })?;
+        let escaped = regex_escape_path(path_str);
+        let rule = format!(
+            "(allow file-write* (regex #\"^{}\\.tmp\\.[0-9]+\\.[0-9]+$\"))",
+            escaped
+        );
+        caps.add_platform_rule(&rule)
+    }
+
+    add_rule_for_path(caps, &cap.resolved)?;
+    if cap.original != cap.resolved {
+        add_rule_for_path(caps, &cap.original)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn add_atomic_write_rule(_caps: &mut CapabilitySet, _cap: &FsCapability) -> Result<()> {
+    Ok(())
+}
+
+/// Escape a filesystem path for use in a Seatbelt regex.
+/// Only metacharacters that could appear in typical paths need escaping.
+#[cfg(target_os = "macos")]
+fn regex_escape_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 8);
+    for c in path.chars() {
+        match c {
+            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn apply_profile_dir_allows(
@@ -44,10 +229,11 @@ fn apply_profile_dir_allows(
     protected_roots: &ProtectedRoots,
     caps: &mut CapabilitySet,
     label_prefix: &str,
+    allow_parent_of_protected: bool,
 ) -> Result<()> {
     for path_template in path_templates {
         let path = expand_vars(path_template, workdir)?;
-        validate_requested_dir(&path, "Profile", protected_roots)?;
+        validate_requested_dir(&path, "Profile", protected_roots, allow_parent_of_protected)?;
         let label = format!(
             "{label_prefix} '{}' does not exist, skipping",
             path_template
@@ -64,12 +250,14 @@ fn validate_requested_dir(
     path: &Path,
     source: &str,
     protected_roots: &ProtectedRoots,
+    allow_parent_of_protected: bool,
 ) -> Result<()> {
     protected_paths::validate_requested_path_against_protected_roots(
         path,
         false,
         source,
         protected_roots.as_paths(),
+        allow_parent_of_protected,
     )
 }
 
@@ -77,12 +265,14 @@ fn validate_requested_file(
     path: &Path,
     source: &str,
     protected_roots: &ProtectedRoots,
+    allow_parent_of_protected: bool,
 ) -> Result<()> {
     protected_paths::validate_requested_path_against_protected_roots(
         path,
         true,
         source,
         protected_roots.as_paths(),
+        allow_parent_of_protected,
     )
 }
 
@@ -90,6 +280,11 @@ pub(crate) fn default_profile_groups() -> Result<Vec<String>> {
     let profile = crate::policy::get_policy_profile("default")?
         .ok_or_else(|| NonoError::ProfileNotFound("default".to_string()))?;
     Ok(profile.security.groups)
+}
+
+#[must_use]
+pub(crate) fn retains_missing_exact_file_grants() -> bool {
+    cfg!(target_os = "macos")
 }
 
 /// Extension trait for CapabilitySet to add CLI-specific construction methods.
@@ -123,7 +318,7 @@ impl CapabilitySetExt for CapabilitySet {
 
         // Directory permissions (canonicalize handles existence check atomically)
         for path in &args.allow {
-            validate_requested_dir(path, "CLI", &protected_roots)?;
+            validate_requested_dir(path, "CLI", &protected_roots, false)?;
             if let Some(cap) =
                 try_new_dir(path, AccessMode::ReadWrite, "Skipping non-existent path")?
             {
@@ -132,14 +327,14 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path in &args.read {
-            validate_requested_dir(path, "CLI", &protected_roots)?;
+            validate_requested_dir(path, "CLI", &protected_roots, false)?;
             if let Some(cap) = try_new_dir(path, AccessMode::Read, "Skipping non-existent path")? {
                 caps.add_fs(cap);
             }
         }
 
         for path in &args.write {
-            validate_requested_dir(path, "CLI", &protected_roots)?;
+            validate_requested_dir(path, "CLI", &protected_roots, false)?;
             if let Some(cap) = try_new_dir(path, AccessMode::Write, "Skipping non-existent path")? {
                 caps.add_fs(cap);
             }
@@ -147,7 +342,7 @@ impl CapabilitySetExt for CapabilitySet {
 
         // Single file permissions
         for path in &args.allow_file {
-            validate_requested_file(path, "CLI", &protected_roots)?;
+            validate_requested_file(path, "CLI", &protected_roots, false)?;
             if let Some(cap) =
                 try_new_file(path, AccessMode::ReadWrite, "Skipping non-existent file")?
             {
@@ -156,14 +351,14 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         for path in &args.read_file {
-            validate_requested_file(path, "CLI", &protected_roots)?;
+            validate_requested_file(path, "CLI", &protected_roots, false)?;
             if let Some(cap) = try_new_file(path, AccessMode::Read, "Skipping non-existent file")? {
                 caps.add_fs(cap);
             }
         }
 
         for path in &args.write_file {
-            validate_requested_file(path, "CLI", &protected_roots)?;
+            validate_requested_file(path, "CLI", &protected_roots, false)?;
             if let Some(cap) = try_new_file(path, AccessMode::Write, "Skipping non-existent file")?
             {
                 caps.add_fs(cap);
@@ -198,6 +393,7 @@ impl CapabilitySetExt for CapabilitySet {
     ) -> Result<(CapabilitySet, bool)> {
         let mut caps = CapabilitySet::new();
         let protected_roots = ProtectedRoots::from_defaults()?;
+        let allow_parent_of_protected = profile.allow_parent_of_protected.unwrap_or(false);
 
         // Resolve policy groups from the already-finalized profile.
         let loaded_policy = policy::load_embedded_policy()?;
@@ -214,7 +410,12 @@ impl CapabilitySetExt for CapabilitySet {
         // Directories with read+write access
         for path_template in &fs.allow {
             let path = expand_vars(path_template, workdir)?;
-            validate_requested_dir(&path, "Profile", &protected_roots)?;
+            validate_requested_dir(
+                &path,
+                "Profile",
+                &protected_roots,
+                allow_parent_of_protected,
+            )?;
             let label = format!("Profile path '{}' does not exist, skipping", path_template);
             if let Some(mut cap) = try_new_dir(&path, AccessMode::ReadWrite, &label)? {
                 cap.source = CapabilitySource::Profile;
@@ -222,12 +423,34 @@ impl CapabilitySetExt for CapabilitySet {
             }
         }
 
-        // Directories with read-only access
+        // Read-only filesystem entries (directory or file)
         for path_template in &fs.read {
             let path = expand_vars(path_template, workdir)?;
-            validate_requested_dir(&path, "Profile", &protected_roots)?;
             let label = format!("Profile path '{}' does not exist, skipping", path_template);
-            if let Some(mut cap) = try_new_dir(&path, AccessMode::Read, &label)? {
+
+            let reads_file = std::fs::metadata(&path)
+                .map(|metadata| !metadata.is_dir())
+                .unwrap_or(false);
+
+            let maybe_cap = if reads_file {
+                validate_requested_file(
+                    &path,
+                    "Profile",
+                    &protected_roots,
+                    allow_parent_of_protected,
+                )?;
+                try_new_file(&path, AccessMode::Read, &label)?
+            } else {
+                validate_requested_dir(
+                    &path,
+                    "Profile",
+                    &protected_roots,
+                    allow_parent_of_protected,
+                )?;
+                try_new_dir(&path, AccessMode::Read, &label)?
+            };
+
+            if let Some(mut cap) = maybe_cap {
                 cap.source = CapabilitySource::Profile;
                 caps.add_fs(cap);
             }
@@ -236,7 +459,12 @@ impl CapabilitySetExt for CapabilitySet {
         // Directories with write-only access
         for path_template in &fs.write {
             let path = expand_vars(path_template, workdir)?;
-            validate_requested_dir(&path, "Profile", &protected_roots)?;
+            validate_requested_dir(
+                &path,
+                "Profile",
+                &protected_roots,
+                allow_parent_of_protected,
+            )?;
             let label = format!("Profile path '{}' does not exist, skipping", path_template);
             if let Some(mut cap) = try_new_dir(&path, AccessMode::Write, &label)? {
                 cap.source = CapabilitySource::Profile;
@@ -247,9 +475,17 @@ impl CapabilitySetExt for CapabilitySet {
         // Single files with read+write access
         for path_template in &fs.allow_file {
             let path = expand_vars(path_template, workdir)?;
-            validate_requested_file(&path, "Profile", &protected_roots)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
-            if let Some(mut cap) = try_new_file(&path, AccessMode::ReadWrite, &label)? {
+            if let Some(mut cap) = try_new_profile_exact_path(
+                &path,
+                AccessMode::ReadWrite,
+                &label,
+                &protected_roots,
+                allow_parent_of_protected,
+            )? {
+                // Also allow atomic-write temp files (e.g. .claude.json.tmp.PID.TS).
+                // Many tools write to a temp file then rename for crash safety.
+                add_atomic_write_rule(&mut caps, &cap)?;
                 cap.source = CapabilitySource::Profile;
                 caps.add_fs(cap);
             }
@@ -258,9 +494,14 @@ impl CapabilitySetExt for CapabilitySet {
         // Single files with read-only access
         for path_template in &fs.read_file {
             let path = expand_vars(path_template, workdir)?;
-            validate_requested_file(&path, "Profile", &protected_roots)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
-            if let Some(mut cap) = try_new_file(&path, AccessMode::Read, &label)? {
+            if let Some(mut cap) = try_new_profile_exact_path(
+                &path,
+                AccessMode::Read,
+                &label,
+                &protected_roots,
+                allow_parent_of_protected,
+            )? {
                 cap.source = CapabilitySource::Profile;
                 caps.add_fs(cap);
             }
@@ -269,9 +510,15 @@ impl CapabilitySetExt for CapabilitySet {
         // Single files with write-only access
         for path_template in &fs.write_file {
             let path = expand_vars(path_template, workdir)?;
-            validate_requested_file(&path, "Profile", &protected_roots)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
-            if let Some(mut cap) = try_new_file(&path, AccessMode::Write, &label)? {
+            if let Some(mut cap) = try_new_profile_exact_path(
+                &path,
+                AccessMode::Write,
+                &label,
+                &protected_roots,
+                allow_parent_of_protected,
+            )? {
+                add_atomic_write_rule(&mut caps, &cap)?;
                 cap.source = CapabilitySource::Profile;
                 caps.add_fs(cap);
             }
@@ -285,6 +532,7 @@ impl CapabilitySetExt for CapabilitySet {
             &protected_roots,
             &mut caps,
             "Profile policy path",
+            allow_parent_of_protected,
         )?;
         apply_profile_dir_allows(
             &profile.policy.add_allow_read,
@@ -293,6 +541,7 @@ impl CapabilitySetExt for CapabilitySet {
             &protected_roots,
             &mut caps,
             "Profile policy path",
+            allow_parent_of_protected,
         )?;
         apply_profile_dir_allows(
             &profile.policy.add_allow_write,
@@ -301,6 +550,7 @@ impl CapabilitySetExt for CapabilitySet {
             &protected_roots,
             &mut caps,
             "Profile policy path",
+            allow_parent_of_protected,
         )?;
 
         for path_template in &profile.policy.add_deny_access {
@@ -330,6 +580,17 @@ impl CapabilitySetExt for CapabilitySet {
                 port: 0,
                 bind_ports,
             });
+
+            // Add allow_domain ports to Landlock ConnectTcp rules so non-HTTP
+            // protocols (NATS, PostgreSQL, etc.) can connect directly while
+            // HTTP traffic still goes through the proxy.
+            // Only on Linux — macOS uses Seatbelt which cannot filter by port;
+            // the proxy handles domain filtering at the application layer.
+            #[cfg(target_os = "linux")]
+            for entry in &profile.network.allow_domain {
+                let port = parse_allow_domain_port(entry);
+                caps.add_tcp_connect_port(port);
+            }
         }
 
         // Localhost IPC ports from profile
@@ -367,7 +628,7 @@ impl CapabilitySetExt for CapabilitySet {
         caps.set_ipc_mode_mut(ipc_mode);
 
         // Apply CLI overrides (CLI args take precedence)
-        add_cli_overrides(&mut caps, args)?;
+        add_cli_overrides(&mut caps, args, allow_parent_of_protected)?;
 
         // Expand profile-level override_deny paths for finalize_caps
         let mut profile_overrides = Vec::with_capacity(profile.policy.override_deny.len());
@@ -415,13 +676,25 @@ fn finalize_caps(
     policy::validate_deny_overlaps(&resolved.deny_paths, caps)?;
 
     // Keep broad keychain deny groups active, but allow explicit
-    // login.keychain-db read grants (profile/CLI) on macOS.
-    policy::apply_macos_login_keychain_exception(caps);
+    // keychain DB read grants (profile/CLI) on macOS.
+    policy::apply_macos_keychain_db_exception(caps);
 
     // Deduplicate capabilities
     caps.deduplicate();
 
     Ok(())
+}
+
+/// Extract port number from an allow_domain entry.
+/// Format: `"host:port"` returns the port, bare `"host"` returns 443 (HTTPS default).
+#[cfg(target_os = "linux")]
+fn parse_allow_domain_port(entry: &str) -> u16 {
+    if let Some((_host, port_str)) = entry.rsplit_once(':') {
+        if let Ok(port) = port_str.parse::<u16>() {
+            return port;
+        }
+    }
+    443
 }
 
 fn apply_cli_network_mode(caps: &mut CapabilitySet, args: &SandboxArgs) {
@@ -436,6 +709,16 @@ fn apply_cli_network_mode(caps: &mut CapabilitySet, args: &SandboxArgs) {
             port: 0,
             bind_ports: args.allow_bind.clone(),
         });
+
+        // Add allow_proxy (--allow-domain) ports to Landlock ConnectTcp rules
+        // so non-HTTP protocols can connect directly.
+        // Only on Linux — macOS Seatbelt cannot filter by port; the proxy
+        // handles domain filtering at the application layer.
+        #[cfg(target_os = "linux")]
+        for entry in &args.allow_proxy {
+            let port = parse_allow_domain_port(entry);
+            caps.add_tcp_connect_port(port);
+        }
     }
 }
 
@@ -445,26 +728,30 @@ fn apply_cli_network_mode(caps: &mut CapabilitySet, args: &SandboxArgs) {
 /// a profile or group capability. The subsequent `deduplicate()` call resolves
 /// conflicts using source priority (User wins over Group/System) and merges
 /// complementary access modes (Read + Write = ReadWrite).
-fn add_cli_overrides(caps: &mut CapabilitySet, args: &SandboxArgs) -> Result<()> {
+fn add_cli_overrides(
+    caps: &mut CapabilitySet,
+    args: &SandboxArgs,
+    allow_parent_of_protected: bool,
+) -> Result<()> {
     let protected_roots = ProtectedRoots::from_defaults()?;
 
     // Additional directories from CLI
     for path in &args.allow {
-        validate_requested_dir(path, "CLI", &protected_roots)?;
+        validate_requested_dir(path, "CLI", &protected_roots, allow_parent_of_protected)?;
         if let Some(cap) = try_new_dir(path, AccessMode::ReadWrite, "Skipping non-existent path")? {
             caps.add_fs(cap);
         }
     }
 
     for path in &args.read {
-        validate_requested_dir(path, "CLI", &protected_roots)?;
+        validate_requested_dir(path, "CLI", &protected_roots, allow_parent_of_protected)?;
         if let Some(cap) = try_new_dir(path, AccessMode::Read, "Skipping non-existent path")? {
             caps.add_fs(cap);
         }
     }
 
     for path in &args.write {
-        validate_requested_dir(path, "CLI", &protected_roots)?;
+        validate_requested_dir(path, "CLI", &protected_roots, allow_parent_of_protected)?;
         if let Some(cap) = try_new_dir(path, AccessMode::Write, "Skipping non-existent path")? {
             caps.add_fs(cap);
         }
@@ -472,7 +759,7 @@ fn add_cli_overrides(caps: &mut CapabilitySet, args: &SandboxArgs) -> Result<()>
 
     // Additional files from CLI
     for path in &args.allow_file {
-        validate_requested_file(path, "CLI", &protected_roots)?;
+        validate_requested_file(path, "CLI", &protected_roots, allow_parent_of_protected)?;
         if let Some(cap) = try_new_file(path, AccessMode::ReadWrite, "Skipping non-existent file")?
         {
             caps.add_fs(cap);
@@ -480,14 +767,14 @@ fn add_cli_overrides(caps: &mut CapabilitySet, args: &SandboxArgs) -> Result<()>
     }
 
     for path in &args.read_file {
-        validate_requested_file(path, "CLI", &protected_roots)?;
+        validate_requested_file(path, "CLI", &protected_roots, allow_parent_of_protected)?;
         if let Some(cap) = try_new_file(path, AccessMode::Read, "Skipping non-existent file")? {
             caps.add_fs(cap);
         }
     }
 
     for path in &args.write_file {
-        validate_requested_file(path, "CLI", &protected_roots)?;
+        validate_requested_file(path, "CLI", &protected_roots, allow_parent_of_protected)?;
         if let Some(cap) = try_new_file(path, AccessMode::Write, "Skipping non-existent file")? {
             caps.add_fs(cap);
         }
@@ -518,6 +805,26 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn with_env_lock<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        f()
+    }
+
+    fn from_args_locked(args: &SandboxArgs) -> Result<(CapabilitySet, bool)> {
+        with_env_lock(|| CapabilitySet::from_args(args))
+    }
+
+    fn from_profile_locked(
+        profile: &crate::profile::Profile,
+        workdir: &Path,
+        args: &SandboxArgs,
+    ) -> Result<(CapabilitySet, bool)> {
+        with_env_lock(|| CapabilitySet::from_profile(profile, workdir, args))
+    }
+
     fn sandbox_args() -> SandboxArgs {
         SandboxArgs::default()
     }
@@ -531,7 +838,7 @@ mod tests {
             ..sandbox_args()
         };
 
-        let (caps, _) = CapabilitySet::from_args(&args).expect("Failed to build caps");
+        let (caps, _) = from_args_locked(&args).expect("Failed to build caps");
         assert!(caps.has_fs());
         assert!(!caps.is_network_blocked());
     }
@@ -543,7 +850,7 @@ mod tests {
             ..sandbox_args()
         };
 
-        let (caps, _) = CapabilitySet::from_args(&args).expect("Failed to build caps");
+        let (caps, _) = from_args_locked(&args).expect("Failed to build caps");
         assert!(caps.is_network_blocked());
     }
 
@@ -556,7 +863,7 @@ mod tests {
             ..sandbox_args()
         };
 
-        let (caps, _) = CapabilitySet::from_args(&args).expect("Failed to build caps");
+        let (caps, _) = from_args_locked(&args).expect("Failed to build caps");
         assert!(caps.allowed_commands().contains(&"rm".to_string()));
         assert!(caps.blocked_commands().contains(&"custom".to_string()));
     }
@@ -571,7 +878,7 @@ mod tests {
             ..sandbox_args()
         };
 
-        let err = CapabilitySet::from_args(&args).expect_err("must reject protected state path");
+        let err = from_args_locked(&args).expect_err("must reject protected state path");
         assert!(
             err.to_string()
                 .contains("overlaps protected nono state root"),
@@ -581,16 +888,62 @@ mod tests {
 
     #[test]
     fn test_from_args_uses_default_profile_groups_for_runtime_policy() {
-        let args = sandbox_args();
-        let (caps, _) = CapabilitySet::from_args(&args).expect("build caps from args");
+        with_env_lock(|| {
+            let args = sandbox_args();
+            let (caps, _) = CapabilitySet::from_args(&args).expect("build caps from args");
 
-        let policy = crate::policy::load_embedded_policy().expect("load embedded policy");
-        let default_groups = default_profile_groups().expect("get default profile groups");
-        let deny_paths = crate::policy::resolve_deny_paths_for_groups(&policy, &default_groups)
-            .expect("resolve deny paths");
+            let policy = crate::policy::load_embedded_policy().expect("load embedded policy");
+            let default_groups = default_profile_groups().expect("get default profile groups");
+            let deny_paths = crate::policy::resolve_deny_paths_for_groups(&policy, &default_groups)
+                .expect("resolve deny paths");
 
-        crate::policy::validate_deny_overlaps(&deny_paths, &caps)
-            .expect("from_args caps should match default profile deny policy");
+            crate::policy::validate_deny_overlaps(&deny_paths, &caps)
+                .expect("from_args caps should match default profile deny policy");
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_from_args_skips_linux_temp_root_when_home_is_nested() {
+        // Use `keep()` so the temp dir is NOT auto-deleted. Tests that call
+        // `tempdir()` concurrently (without the env lock) may create dirs
+        // inside our temp_root while TMPDIR points to it. If we deleted it,
+        // those dirs would vanish and cause flaky failures.
+        let temp_root = tempdir().expect("tmpdir").keep();
+        let home = temp_root.join("home");
+        let allowed = temp_root.join("other");
+        std::fs::create_dir_all(&home).expect("create home");
+        std::fs::create_dir_all(&allowed).expect("create allowed dir");
+
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let home_str = home.to_string_lossy().into_owned();
+        let tmpdir_str = temp_root.to_string_lossy().into_owned();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", home_str.as_str()),
+            ("TMPDIR", tmpdir_str.as_str()),
+        ]);
+
+        let args = SandboxArgs {
+            allow: vec![allowed.clone()],
+            ..sandbox_args()
+        };
+
+        let result = CapabilitySet::from_args(&args);
+
+        let (caps, _) = result.expect(
+            "from_args should succeed when HOME is nested under TMPDIR and the user grants a sibling path",
+        );
+        let allowed_canonical = allowed.canonicalize().expect("canonicalize allowed dir");
+        assert!(
+            caps.fs_capabilities()
+                .iter()
+                .any(|cap| !cap.is_file && cap.resolved == allowed_canonical),
+            "explicit user grant under TMPDIR should still be present"
+        );
     }
 
     #[test]
@@ -611,8 +964,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
         assert!(
             caps.allowed_commands().contains(&"rm".to_string()),
             "profile allowed_commands should include 'rm'"
@@ -620,6 +972,187 @@ mod tests {
         assert!(
             caps.allowed_commands().contains(&"shred".to_string()),
             "profile allowed_commands should include 'shred'"
+        );
+    }
+
+    #[test]
+    fn test_from_profile_filesystem_read_accepts_file_paths() {
+        let dir = tempdir().expect("tmpdir");
+        let read_file = dir.path().join("config.txt");
+        std::fs::write(&read_file, "token=123").expect("write file");
+
+        let profile_path = dir.path().join("read-file-profile.json");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{
+                "meta": {{ "name": "read-file-profile" }},
+                "filesystem": {{ "read": ["{}"] }}
+            }}"#,
+                read_file.display()
+            ),
+        )
+        .expect("write profile");
+
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+        let workdir = tempdir().expect("workdir");
+        let args = sandbox_args();
+
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
+        let resolved_file = read_file.canonicalize().expect("canonicalize file");
+
+        assert!(
+            caps.fs_capabilities().iter().any(|cap| {
+                cap.is_file && cap.access == AccessMode::Read && cap.resolved == resolved_file
+            }),
+            "filesystem.read file entries should be granted as read-only file capabilities"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_from_profile_allow_file_keeps_missing_exact_file_on_macos() {
+        let dir = tempdir().expect("tmpdir");
+        let missing_file = dir.path().join("future.lock");
+        let expected_resolved = dir.path().canonicalize().expect("canonicalize dir").join(
+            missing_file
+                .file_name()
+                .expect("future file should have file name"),
+        );
+
+        let profile_path = dir.path().join("missing-file-profile.json");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{
+                "meta": {{ "name": "missing-file-profile" }},
+                "filesystem": {{ "allow_file": ["{}"] }}
+            }}"#,
+                missing_file.display()
+            ),
+        )
+        .expect("write profile");
+
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+        let workdir = tempdir().expect("workdir");
+        let args = sandbox_args();
+
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
+
+        assert!(
+            caps.fs_capabilities().iter().any(|cap| {
+                cap.is_file
+                    && cap.access == AccessMode::ReadWrite
+                    && cap.original == missing_file
+                    && cap.resolved == expected_resolved
+            }),
+            "macOS profiles should preserve explicit missing exact-file grants"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_from_args_allow_file_resolves_parent_symlinks_for_missing_file_on_macos() {
+        let dir = tempdir().expect("tmpdir");
+        let target_dir = dir.path().join("target");
+        let link_dir = dir.path().join("link");
+        std::fs::create_dir_all(&target_dir).expect("create target dir");
+        std::os::unix::fs::symlink(&target_dir, &link_dir).expect("create symlink");
+
+        let missing_file = link_dir.join("future.lock");
+        let resolved_file = target_dir
+            .canonicalize()
+            .expect("canonicalize target dir")
+            .join("future.lock");
+        let args = SandboxArgs {
+            allow_file: vec![missing_file.clone()],
+            ..sandbox_args()
+        };
+
+        let (caps, _) = from_args_locked(&args).expect("build caps");
+
+        assert!(
+            caps.fs_capabilities().iter().any(|cap| {
+                cap.is_file
+                    && cap.access == AccessMode::ReadWrite
+                    && cap.original == missing_file
+                    && cap.resolved == resolved_file
+            }),
+            "macOS CLI exact-file grants should preserve original path and resolve parent symlinks"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_from_profile_allow_file_falls_back_to_exact_directory_when_present() {
+        let dir = tempdir().expect("tmpdir");
+        let lock_dir = dir.path().join("claude.lock");
+        std::fs::create_dir_all(&lock_dir).expect("create lock dir");
+        let resolved_dir = lock_dir.canonicalize().expect("canonicalize lock dir");
+        let child = lock_dir.join("nested.txt");
+
+        let profile_path = dir.path().join("lock-dir-profile.json");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{
+                "meta": {{ "name": "lock-dir-profile" }},
+                "filesystem": {{ "allow_file": ["{}"] }}
+            }}"#,
+                lock_dir.display()
+            ),
+        )
+        .expect("write profile");
+
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+        let workdir = tempdir().expect("workdir");
+        let args = sandbox_args();
+
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
+
+        assert!(
+            caps.fs_capabilities().iter().any(|cap| {
+                cap.is_file
+                    && cap.access == AccessMode::ReadWrite
+                    && cap.original == lock_dir
+                    && cap.resolved == resolved_dir
+            }),
+            "macOS profiles should preserve exact-path semantics when an allow_file entry resolves to a directory"
+        );
+        assert!(
+            !caps.path_covered(&child),
+            "exact-path fallback must not recursively cover descendants"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn test_from_profile_allow_file_rejects_directory_when_exact_dir_unsupported() {
+        let dir = tempdir().expect("tmpdir");
+        let lock_dir = dir.path().join("claude.lock");
+        std::fs::create_dir_all(&lock_dir).expect("create lock dir");
+
+        let profile_path = dir.path().join("lock-dir-profile.json");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{
+                "meta": {{ "name": "lock-dir-profile" }},
+                "filesystem": {{ "allow_file": ["{}"] }}
+            }}"#,
+                lock_dir.display()
+            ),
+        )
+        .expect("write profile");
+
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+        let workdir = tempdir().expect("workdir");
+        let args = sandbox_args();
+
+        let err = from_profile_locked(&profile, workdir.path(), &args).expect_err("should fail");
+        assert!(
+            matches!(err, NonoError::ExpectedFile(ref p) if p == &lock_dir),
+            "expected exact-file entries resolving to directories to fail closed, got: {err}"
         );
     }
 
@@ -643,8 +1176,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
         assert!(
             !caps.blocked_commands().contains(&"rm".to_string()),
             "excluded dangerous_commands should remove rm from blocked commands"
@@ -679,8 +1211,7 @@ mod tests {
         let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         assert!(
             !caps.blocked_commands().contains(&"rm".to_string()),
@@ -725,8 +1256,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         let read_canonical = read_dir.canonicalize().expect("canonicalize read");
         let write_canonical = write_dir.canonicalize().expect("canonicalize write");
@@ -782,7 +1312,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let err = CapabilitySet::from_profile(&profile, workdir.path(), &args)
+        let err = from_profile_locked(&profile, workdir.path(), &args)
             .expect_err("profile deny overlap should fail on linux");
         assert!(
             err.to_string().contains("Landlock deny-overlap"),
@@ -822,7 +1352,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let err = CapabilitySet::from_profile(&profile, workdir.path(), &args)
+        let err = from_profile_locked(&profile, workdir.path(), &args)
             .expect_err("symlinked deny overlap should fail on linux");
         assert!(
             err.to_string().contains("Landlock deny-overlap"),
@@ -849,6 +1379,7 @@ mod tests {
                         "read_file": ["{}"]
                     }},
                     "policy": {{
+                        "exclude_groups": ["system_read_linux", "system_write_linux"],
                         "add_deny_access": ["{}"]
                     }}
                 }}"#,
@@ -862,8 +1393,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         assert!(
             !caps
@@ -893,6 +1423,7 @@ mod tests {
                         "read_file": ["{}"]
                     }},
                     "policy": {{
+                        "exclude_groups": ["system_read_linux", "system_write_linux"],
                         "add_deny_access": ["{}"]
                     }}
                 }}"#,
@@ -907,8 +1438,7 @@ mod tests {
         let mut args = sandbox_args();
         args.override_deny = vec![target.clone()];
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         assert!(
             caps.fs_capabilities()
@@ -952,8 +1482,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         assert!(
             caps.fs_capabilities()
@@ -984,8 +1513,7 @@ mod tests {
         let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
 
         let args = sandbox_args();
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         let rules = caps.platform_rules().join("\n");
         // On macOS, tempdir is under /var/folders which is a symlink to /private/var/folders.
@@ -1047,8 +1575,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         let rules = caps.platform_rules().join("\n");
         assert!(
@@ -1090,8 +1617,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         // The allow should survive because override_deny punches through the deny
         let canonical = denied.canonicalize().expect("canonicalize");
@@ -1132,7 +1658,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let err = CapabilitySet::from_profile(&profile, workdir.path(), &args)
+        let err = from_profile_locked(&profile, workdir.path(), &args)
             .expect_err("override_deny without user-intent grant should fail");
         assert!(
             err.to_string().contains("no matching grant"),
@@ -1149,7 +1675,7 @@ mod tests {
         let args = sandbox_args();
 
         let (mut caps, needs_unlink_overrides) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("Failed to build");
+            from_profile_locked(&profile, workdir.path(), &args).expect("Failed to build");
 
         // Simulate what main.rs does: apply unlink overrides after all paths finalized
         if needs_unlink_overrides {
@@ -1216,8 +1742,7 @@ mod tests {
             ..sandbox_args()
         };
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         let canonical = target.canonicalize().expect("canonicalize target");
         let cap = caps
@@ -1262,8 +1787,7 @@ mod tests {
             ..sandbox_args()
         };
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         let canonical = target.canonicalize().expect("canonicalize target");
         let cap = caps
@@ -1290,8 +1814,7 @@ mod tests {
             ..sandbox_args()
         };
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         assert_eq!(*caps.network_mode(), nono::NetworkMode::AllowAll);
     }
@@ -1317,8 +1840,7 @@ mod tests {
             ..sandbox_args()
         };
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         assert_eq!(*caps.network_mode(), nono::NetworkMode::AllowAll);
     }
@@ -1339,8 +1861,7 @@ mod tests {
         let workdir = tempdir().expect("tmpdir");
         let args = sandbox_args();
         let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
         assert_eq!(
             caps.process_info_mode(),
             nono::ProcessInfoMode::AllowSameSandbox,
@@ -1364,8 +1885,7 @@ mod tests {
         let workdir = tempdir().expect("tmpdir");
         let args = sandbox_args();
         let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
         assert_eq!(
             caps.ipc_mode(),
             nono::IpcMode::Full,
@@ -1389,8 +1909,7 @@ mod tests {
         let workdir = tempdir().expect("tmpdir");
         let args = sandbox_args();
         let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
         assert_eq!(
             caps.ipc_mode(),
             nono::IpcMode::SharedMemoryOnly,
@@ -1414,12 +1933,164 @@ mod tests {
         let workdir = tempdir().expect("tmpdir");
         let args = sandbox_args();
         let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
         assert_eq!(
             caps.ipc_mode(),
             nono::IpcMode::SharedMemoryOnly,
             "absent profile ipc_mode should default to SharedMemoryOnly"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_parse_allow_domain_port_with_explicit_port() {
+        assert_eq!(parse_allow_domain_port("nats.example.com:4222"), 4222);
+        assert_eq!(parse_allow_domain_port("postgres.example.com:5432"), 5432);
+        assert_eq!(parse_allow_domain_port("localhost:8080"), 8080);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_parse_allow_domain_port_default() {
+        assert_eq!(parse_allow_domain_port("api.example.com"), 443);
+        assert_eq!(parse_allow_domain_port("*.example.com"), 443);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_parse_allow_domain_port_invalid_port() {
+        // Invalid port string falls back to 443
+        assert_eq!(parse_allow_domain_port("host:notaport"), 443);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_from_profile_allow_domain_ports_added_to_tcp_connect() {
+        let dir = tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("allow-domain-ports.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "allow-domain-ports" },
+                "filesystem": { "allow": ["/tmp"] },
+                "network": {
+                    "allow_domain": [
+                        "api.example.com",
+                        "nats.example.com:4222",
+                        "postgres.example.com:5432"
+                    ]
+                }
+            }"#,
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+
+        let workdir = tempdir().expect("workdir");
+        let args = sandbox_args();
+
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
+
+        let ports = caps.tcp_connect_ports();
+        assert!(
+            ports.contains(&443),
+            "tcp_connect_ports should contain 443 for bare domain, got: {:?}",
+            ports
+        );
+        assert!(
+            ports.contains(&4222),
+            "tcp_connect_ports should contain 4222 for nats.example.com:4222, got: {:?}",
+            ports
+        );
+        assert!(
+            ports.contains(&5432),
+            "tcp_connect_ports should contain 5432 for postgres.example.com:5432, got: {:?}",
+            ports
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_regex_escape_path_dots() {
+        assert_eq!(
+            regex_escape_path("/Users/me/.claude.json"),
+            "/Users/me/\\.claude\\.json"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_from_args_allow_proxy_ports_added_to_tcp_connect() {
+        let args = SandboxArgs {
+            allow_proxy: vec![
+                "api.example.com".to_string(),
+                "nats.example.com:4222".to_string(),
+            ],
+            ..sandbox_args()
+        };
+
+        let (caps, _) = from_args_locked(&args).expect("build caps");
+
+        let ports = caps.tcp_connect_ports();
+        assert!(
+            ports.contains(&443),
+            "tcp_connect_ports should contain 443 for bare domain, got: {:?}",
+            ports
+        );
+        assert!(
+            ports.contains(&4222),
+            "tcp_connect_ports should contain 4222 for nats.example.com:4222, got: {:?}",
+            ports
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_regex_escape_path_no_metacharacters() {
+        assert_eq!(regex_escape_path("/usr/local/bin"), "/usr/local/bin");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_regex_escape_path_special_chars() {
+        assert_eq!(
+            regex_escape_path("/path/with+parens(1)[2]"),
+            "/path/with\\+parens\\(1\\)\\[2\\]"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_atomic_write_rule_adds_regex_for_writable_file() {
+        let tmp = tempdir().expect("tempdir");
+        let file_path = tmp.path().join("test.json");
+        std::fs::write(&file_path, "{}").expect("write");
+        let cap = FsCapability::new_file(&file_path, AccessMode::ReadWrite).expect("cap");
+        let mut caps = CapabilitySet::new();
+        add_atomic_write_rule(&mut caps, &cap).expect("add rule");
+        let rules = caps.platform_rules().join("\n");
+        assert!(
+            rules.contains("file-write*"),
+            "should contain file-write rule"
+        );
+        assert!(
+            rules.contains(r"\.tmp\.[0-9]+\.[0-9]+"),
+            "should contain temp file pattern, got: {}",
+            rules
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_atomic_write_rule_skips_readonly_file() {
+        let tmp = tempdir().expect("tempdir");
+        let file_path = tmp.path().join("readonly.json");
+        std::fs::write(&file_path, "{}").expect("write");
+        let cap = FsCapability::new_file(&file_path, AccessMode::Read).expect("cap");
+        let mut caps = CapabilitySet::new();
+        add_atomic_write_rule(&mut caps, &cap).expect("add rule");
+        assert!(
+            caps.platform_rules().is_empty(),
+            "read-only file should not get atomic write rule"
         );
     }
 }

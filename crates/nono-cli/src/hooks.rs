@@ -46,9 +46,13 @@ pub enum HookInstallResult {
 /// 3. Registers the hook in the application's settings
 ///
 /// Returns the installation result so callers can inform the user.
-pub fn install_hooks(target: &str, config: &HookConfig) -> Result<HookInstallResult> {
+pub fn install_hooks(
+    profile_name: Option<&str>,
+    target: &str,
+    config: &HookConfig,
+) -> Result<HookInstallResult> {
     match target {
-        "claude-code" => install_claude_code_hook(config),
+        "claude-code" => install_claude_code_hook(profile_name, config),
         other => {
             tracing::warn!(
                 "Unknown hook target '{}', skipping hook installation",
@@ -62,15 +66,16 @@ pub fn install_hooks(target: &str, config: &HookConfig) -> Result<HookInstallRes
 /// Install Claude Code hook
 ///
 /// Installs to ~/.claude/hooks/ and updates ~/.claude/settings.json
-fn install_claude_code_hook(config: &HookConfig) -> Result<HookInstallResult> {
+fn install_claude_code_hook(
+    profile_name: Option<&str>,
+    config: &HookConfig,
+) -> Result<HookInstallResult> {
     let home = xdg_home::home_dir().ok_or(NonoError::HomeNotFound)?;
     let hooks_dir = home.join(".claude").join("hooks");
     let script_path = hooks_dir.join(&config.script);
     let settings_path = home.join(".claude").join("settings.json");
 
-    // Get embedded script content
-    let script_content = get_embedded_script(&config.script)
-        .ok_or_else(|| NonoError::HookInstall(format!("Unknown hook script: {}", config.script)))?;
+    let script_content = resolve_hook_script(profile_name, config)?;
 
     // Create hooks directory if needed
     if !hooks_dir.exists() {
@@ -235,14 +240,49 @@ fn update_claude_settings(settings_path: &PathBuf, config: &HookConfig) -> Resul
 /// Install all hooks from a profile's hooks configuration
 /// Returns a list of (target, result) pairs for each hook installed
 pub fn install_profile_hooks(
+    profile_name: Option<&str>,
     hooks: &HashMap<String, HookConfig>,
 ) -> Result<Vec<(String, HookInstallResult)>> {
     let mut results = Vec::new();
     for (target, config) in hooks {
-        let result = install_hooks(target, config)?;
+        let result = install_hooks(profile_name, target, config)?;
         results.push((target.clone(), result));
     }
     Ok(results)
+}
+
+fn resolve_hook_script(profile_name: Option<&str>, config: &HookConfig) -> Result<String> {
+    if let Some(profile_name) = profile_name {
+        if let Some(package_dir) = crate::profile::get_package_for_profile(profile_name) {
+            let package_script = package_dir.join("hooks").join(&config.script);
+            if package_script.exists() {
+                return fs::read_to_string(&package_script).map_err(|e| {
+                    NonoError::HookInstall(format!(
+                        "Failed to read package hook script {}: {}",
+                        package_script.display(),
+                        e
+                    ))
+                });
+            }
+        }
+    }
+
+    let user_override = crate::package::nono_config_dir()?
+        .join("hooks")
+        .join(&config.script);
+    if user_override.exists() {
+        return fs::read_to_string(&user_override).map_err(|e| {
+            NonoError::HookInstall(format!(
+                "Failed to read user hook override {}: {}",
+                user_override.display(),
+                e
+            ))
+        });
+    }
+
+    get_embedded_script(&config.script)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| NonoError::HookInstall(format!("Unknown hook script: {}", config.script)))
 }
 
 #[cfg(test)]

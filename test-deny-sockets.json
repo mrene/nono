@@ -1,0 +1,11 @@
+{
+  "extends": "default",
+  "meta": {
+    "name": "test-deny-sockets",
+    "version": "1.0.0",
+    "description": "Default + wezterm SSH agent socket deny"
+  },
+  "policy": {
+    "add_deny_sockets": ["/run/user/1000/wezterm/"]
+  }
+}

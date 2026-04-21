@@ -247,21 +247,30 @@ fn path_filters_for_cap(cap: &crate::capability::FsCapability) -> Result<Vec<Str
     Ok(filters)
 }
 
-/// Returns true if the capability set explicitly grants access to the login keychain DB.
+/// Returns true if the capability set explicitly grants access to a keychain DB.
 ///
 /// This is a narrow opt-in for tools that need OAuth/session refresh via macOS Keychain.
-fn has_explicit_login_keychain_db_access(caps: &CapabilitySet) -> bool {
-    let user_login_db = std::env::var("HOME")
-        .ok()
-        .map(|home| Path::new(&home).join("Library/Keychains/login.keychain-db"));
-    let system_login_db = Path::new("/Library/Keychains/login.keychain-db");
+fn has_explicit_keychain_db_access(caps: &CapabilitySet) -> bool {
+    let user_keychain_dbs = std::env::var("HOME").ok().map(|home| {
+        [
+            Path::new(&home).join("Library/Keychains/login.keychain-db"),
+            Path::new(&home).join("Library/Keychains/metadata.keychain-db"),
+        ]
+    });
+    let system_keychain_dbs = [
+        Path::new("/Library/Keychains/login.keychain-db").to_path_buf(),
+        Path::new("/Library/Keychains/metadata.keychain-db").to_path_buf(),
+    ];
 
-    let is_login_db = |path: &Path| -> bool {
-        if path == system_login_db {
+    let is_keychain_db = |path: &Path| -> bool {
+        if system_keychain_dbs
+            .iter()
+            .any(|candidate| path == candidate)
+        {
             return true;
         }
-        if let Some(ref user_login_db) = user_login_db {
-            if path == user_login_db {
+        if let Some(ref user_keychain_dbs) = user_keychain_dbs {
+            if user_keychain_dbs.iter().any(|candidate| path == candidate) {
                 return true;
             }
         }
@@ -270,7 +279,7 @@ fn has_explicit_login_keychain_db_access(caps: &CapabilitySet) -> bool {
 
     caps.fs_capabilities()
         .iter()
-        .any(|cap| is_login_db(&cap.original) || is_login_db(&cap.resolved))
+        .any(|cap| is_keychain_db(&cap.original) || is_keychain_db(&cap.resolved))
 }
 
 /// Escape a path for use in Seatbelt profile strings.
@@ -312,18 +321,27 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
 
     // Start with deny default
     profile.push_str("(deny default)\n");
+    if caps.seatbelt_debug_deny() {
+        profile.push_str("(debug deny)\n");
+    }
 
     // Allow specific process operations needed for execution
     profile.push_str("(allow process-exec*)\n");
     profile.push_str("(allow process-fork)\n");
 
-    // Process info: allow self-inspection, then apply mode-based rule for others
-    profile.push_str("(allow process-info* (target self))\n");
+    // Process info: allow self-inspection and same-sandbox inspection for both
+    // Isolated and AllowSameSandbox, matching Linux behaviour where Landlock
+    // cannot distinguish the two. Denying process-info for same-sandbox children
+    // would break health checks via proc_pidinfo() / sysctl(KERN_PROC) that
+    // Node.js modules use to monitor child process state.
+    //
+    // We emit (target self) alongside (target same-sandbox) because Seatbelt's
+    // same-sandbox filter may not subsume self — being explicit ensures the
+    // process can always inspect itself regardless of implementation details.
     match caps.process_info_mode() {
-        crate::capability::ProcessInfoMode::Isolated => {
-            profile.push_str("(deny process-info* (target others))\n");
-        }
-        crate::capability::ProcessInfoMode::AllowSameSandbox => {
+        crate::capability::ProcessInfoMode::Isolated
+        | crate::capability::ProcessInfoMode::AllowSameSandbox => {
+            profile.push_str("(allow process-info* (target self))\n");
             profile.push_str("(allow process-info* (target same-sandbox))\n");
         }
         crate::capability::ProcessInfoMode::AllowAll => {
@@ -335,15 +353,29 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     profile.push_str("(allow sysctl-read)\n");
 
     // Mach IPC: allow service resolution. Deny Keychain/security services by default.
-    // If login.keychain-db is explicitly granted, skip these denies so profiles that
+    // If a keychain DB is explicitly granted, skip these denies so profiles that
     // intentionally rely on macOS Keychain OAuth refresh can work.
     //
     // Without these denies, blanket mach-lookup can permit Keychain retrieval via
     // Mach IPC, bypassing file-level deny rules in profiles that do NOT opt in.
     profile.push_str("(allow mach-lookup)\n");
-    if !has_explicit_login_keychain_db_access(caps) {
+    if !has_explicit_keychain_db_access(caps) {
+        // Legacy keychain daemon names (macOS < 13)
         profile.push_str("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))\n");
         profile.push_str("(deny mach-lookup (global-name \"com.apple.securityd\"))\n");
+        // Modern keychain daemon (macOS 13 Ventura+). Legacy SecKeychain APIs
+        // route here on Ventura and later, bypassing the legacy service denies above.
+        // Without this deny, FFI/ctypes callers can read keychain entries despite
+        // the file-level deny on ~/Library/Keychains.
+        profile.push_str("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))\n");
+        // Modern security daemon (macOS 10.10+). SecItem APIs ("Data Protection"
+        // keychain) route through secd. Blocking this prevents access to iCloud
+        // Keychain and modern keychain items that bypass the legacy daemon paths.
+        profile.push_str("(deny mach-lookup (global-name \"com.apple.secd\"))\n");
+        // Security agent: shows keychain authorization dialogs. Without this deny, the
+        // agent can act as a proxy — presenting a user prompt and returning the credential
+        // on behalf of the sandboxed process even when the direct daemon paths are blocked.
+        profile.push_str("(deny mach-lookup (global-name \"com.apple.security.agent\"))\n");
     }
     profile.push_str("(allow mach-per-user-lookup)\n");
     profile.push_str("(allow mach-task-name)\n");
@@ -364,22 +396,24 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         profile.push_str("(allow ipc-posix-sem*)\n");
     }
 
-    // Signal isolation: (target self) restricts kill() to the calling process's
-    // own PID only. This blocks signals to external processes but also blocks
-    // the parent from signaling forked children via kill(). Terminal-generated
-    // signals (Ctrl+C → SIGINT to foreground process group) are delivered by
-    // the kernel and bypass this restriction, so interactive use is unaffected.
-    // In monitor mode, the parent's signal forwarding handler will get EPERM
-    // when trying to forward to the child — this is tolerated silently.
+    // Signal isolation: both Isolated and AllowSameSandbox emit
+    // (target self) + (target same-sandbox). This matches Linux behaviour
+    // where Landlock's LANDLOCK_SCOPE_SIGNAL scopes to the sandbox domain,
+    // not to the calling process alone — making Isolated and AllowSameSandbox
+    // equivalent.
     //
-    // Note: for AllowSameSandbox we emit both (target self) and (target same-sandbox)
-    // because Seatbelt's same-sandbox filter may not subsume self — being explicit
-    // ensures the process can always signal itself regardless of implementation details.
+    // Emitting only (target self) for Isolated would prevent the sandboxed
+    // process from signaling its own forked children, causing orphan process
+    // accumulation when the parent calls kill(child_pid, SIGTERM) and gets
+    // EPERM. Terminal-generated signals (Ctrl+C → SIGINT) bypass Seatbelt
+    // since they are delivered by the kernel to the foreground process group.
+    //
+    // We emit both (target self) and (target same-sandbox) because Seatbelt's
+    // same-sandbox filter may not subsume self — being explicit ensures the
+    // process can always signal itself regardless of implementation details.
     match caps.signal_mode() {
-        crate::capability::SignalMode::Isolated => {
-            profile.push_str("(allow signal (target self))\n");
-        }
-        crate::capability::SignalMode::AllowSameSandbox => {
+        crate::capability::SignalMode::Isolated
+        | crate::capability::SignalMode::AllowSameSandbox => {
             profile.push_str("(allow signal (target self))\n");
             profile.push_str("(allow signal (target same-sandbox))\n");
         }
@@ -387,7 +421,10 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             profile.push_str("(allow signal)\n");
         }
     }
-    profile.push_str("(allow system-socket)\n");
+    // system-socket is NOT granted globally — each NetworkMode branch emits
+    // only the socket domains it needs (AF_UNIX for DNS, AF_INET/AF_INET6
+    // for TCP). AllowAll emits the blanket rule. This prevents restricted
+    // modes from creating arbitrary socket types.
     profile.push_str("(allow system-fsctl)\n");
     profile.push_str("(allow system-info)\n");
 
@@ -485,10 +522,70 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     }
 
     // Network rules
+    //
+    // DNS resolution rules for restricted modes (Blocked/ProxyOnly):
+    // macOS resolves all DNS through /var/run/mDNSResponder (a Unix domain
+    // socket). Seatbelt classifies connect(2) on Unix sockets as
+    // network-outbound, so (deny network*) blocks DNS. These rules allow
+    // AF_UNIX socket creation and outbound to the mDNSResponder path (both
+    // /var/run and /private/var/run since /var is a symlink on macOS).
+    const MDNS_RULES: &str = "\
+(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))\n\
+(allow network-outbound (path \"/private/var/run/mDNSResponder\"))\n\
+(allow network-outbound (path \"/var/run/mDNSResponder\"))\n";
+
     let localhost_ports = caps.localhost_ports();
     match caps.network_mode() {
         NetworkMode::Blocked => {
             profile.push_str("(deny network*)\n");
+            profile.push_str(MDNS_RULES);
+            // On macOS, connect(2) to a Unix domain socket is classified by Seatbelt
+            // as network-outbound. Emit per-path rules for all explicitly granted
+            // filesystem capabilities so that Unix sockets (IPC, notification daemons,
+            // etc.) remain reachable in restricted modes. See: #687
+            //
+            // Files   -> (allow network-outbound (path "..."))   literal socket path
+            // Dirs    -> (allow network-outbound (subpath "...")) sockets anywhere inside
+            //
+            // Both resolved and original paths are emitted to handle /tmp -> /private/tmp
+            // symlinks, matching the mDNSResponder dual-path pattern above.
+            for cap in caps.fs_capabilities() {
+                let (filter, resolved_str) = if cap.is_file {
+                    (
+                        "path",
+                        cap.resolved.to_str().ok_or_else(|| {
+                            NonoError::SandboxInit(format!(
+                                "path contains non-UTF-8 bytes: {}",
+                                cap.resolved.display()
+                            ))
+                        })?,
+                    )
+                } else {
+                    (
+                        "subpath",
+                        cap.resolved.to_str().ok_or_else(|| {
+                            NonoError::SandboxInit(format!(
+                                "path contains non-UTF-8 bytes: {}",
+                                cap.resolved.display()
+                            ))
+                        })?,
+                    )
+                };
+                let escaped = escape_path(resolved_str)?;
+                profile.push_str(&format!(
+                    "(allow network-outbound ({} \"{}\"))\n",
+                    filter, escaped
+                ));
+                if cap.original != cap.resolved {
+                    if let Some(orig_str) = cap.original.to_str() {
+                        let escaped_orig = escape_path(orig_str)?;
+                        profile.push_str(&format!(
+                            "(allow network-outbound ({} \"{}\"))\n",
+                            filter, escaped_orig
+                        ));
+                    }
+                }
+            }
             if !localhost_ports.is_empty() {
                 // Allow system-socket for TCP (required for connect/bind)
                 profile.push_str(
@@ -510,8 +607,46 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         }
         NetworkMode::ProxyOnly { port, bind_ports } => {
             // Block all network, then allow only localhost TCP to the proxy port.
-            // system-socket is required for TCP connect to function.
             profile.push_str("(deny network*)\n");
+            profile.push_str(MDNS_RULES);
+            // Same Unix socket logic as Blocked mode above. See: #687
+            for cap in caps.fs_capabilities() {
+                let (filter, resolved_str) = if cap.is_file {
+                    (
+                        "path",
+                        cap.resolved.to_str().ok_or_else(|| {
+                            NonoError::SandboxInit(format!(
+                                "path contains non-UTF-8 bytes: {}",
+                                cap.resolved.display()
+                            ))
+                        })?,
+                    )
+                } else {
+                    (
+                        "subpath",
+                        cap.resolved.to_str().ok_or_else(|| {
+                            NonoError::SandboxInit(format!(
+                                "path contains non-UTF-8 bytes: {}",
+                                cap.resolved.display()
+                            ))
+                        })?,
+                    )
+                };
+                let escaped = escape_path(resolved_str)?;
+                profile.push_str(&format!(
+                    "(allow network-outbound ({} \"{}\"))\n",
+                    filter, escaped
+                ));
+                if cap.original != cap.resolved {
+                    if let Some(orig_str) = cap.original.to_str() {
+                        let escaped_orig = escape_path(orig_str)?;
+                        profile.push_str(&format!(
+                            "(allow network-outbound ({} \"{}\"))\n",
+                            filter, escaped_orig
+                        ));
+                    }
+                }
+            }
             profile.push_str(&format!(
                 "(allow network-outbound (remote tcp \"localhost:{}\"))\n",
                 port
@@ -522,8 +657,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
                     lp
                 ));
             }
-            // Scope system-socket to TCP only. Without this restriction,
-            // the child could create Unix domain sockets for local IPC.
+            // Scope system-socket for TCP (required for connect/bind to proxy).
             profile.push_str(
                 "(allow system-socket (socket-domain AF_INET) (socket-type SOCK_STREAM))\n",
             );
@@ -539,6 +673,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             }
         }
         NetworkMode::AllowAll => {
+            profile.push_str("(allow system-socket)\n");
             profile.push_str("(allow network-outbound)\n");
             profile.push_str("(allow network-inbound)\n");
             profile.push_str("(allow network-bind)\n");
@@ -550,8 +685,8 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     if !caps.tcp_connect_ports().is_empty() || !caps.tcp_bind_ports().is_empty() {
         return Err(NonoError::NetworkFilterUnsupported {
             platform: "macOS".to_string(),
-            reason: "Seatbelt cannot filter by TCP port. Use --allow-proxy for host-level \
-                     filtering or ProxyOnly mode instead."
+            reason: "Seatbelt cannot filter by TCP port. Use --allow-domain for host-level \
+                     filtering (routed through the proxy) or ProxyOnly mode instead."
                 .to_string(),
         });
     }
@@ -678,7 +813,8 @@ mod tests {
         let profile = generate_profile(&caps).unwrap();
 
         assert!(profile.contains("(deny network*)"));
-        assert!(!profile.contains("(allow network-outbound)"));
+        // Should NOT have general outbound allow (only mDNSResponder path allows)
+        assert!(!profile.contains("(allow network-outbound)\n"));
     }
 
     #[test]
@@ -797,6 +933,67 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_profile_with_gpu_iokit_rules() {
+        let mut caps = CapabilitySet::new();
+        // Minimal IOKit surface: AGXDeviceUserClient is the only class required
+        // for Metal compute on Apple Silicon. IOSurfaceRootUserClient is tried
+        // opportunistically but Metal continues without it when denied.
+        caps.add_platform_rule(
+            "(allow iokit-open \
+                (iokit-user-client-class \
+                    \"AGXDeviceUserClient\"))",
+        )
+        .unwrap();
+        caps.add_platform_rule("(allow iokit-get-properties)")
+            .unwrap();
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow iokit-open"));
+        assert!(profile.contains("AGXDeviceUserClient"));
+        assert!(!profile.contains("IOGPU"));
+        assert!(!profile.contains("AGXSharedUserClient"));
+        assert!(!profile.contains("IOSurfaceRootUserClient"));
+        assert!(profile.contains("(allow iokit-get-properties)"));
+    }
+
+    #[test]
+    fn test_generate_profile_gpu_rules_ordering() {
+        // GPU rules (as platform rules) should appear between read and write rules
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/test"),
+            resolved: PathBuf::from("/test"),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+        caps.add_platform_rule("(allow iokit-get-properties)")
+            .unwrap();
+
+        let profile = generate_profile(&caps).unwrap();
+
+        let read_pos = profile
+            .find("(allow file-read* (subpath \"/test\"))")
+            .expect("read rule not found");
+        let iokit_pos = profile
+            .find("(allow iokit-get-properties)")
+            .expect("iokit rule not found");
+        let write_pos = profile
+            .find("(allow file-write* (subpath \"/test\"))")
+            .expect("write rule not found");
+
+        assert!(
+            read_pos < iokit_pos,
+            "read rules must come before GPU/IOKit platform rules"
+        );
+        assert!(
+            iokit_pos < write_pos,
+            "GPU/IOKit platform rules must come before write rules"
+        );
+    }
+
+    #[test]
     fn test_escape_path_injection_via_newline() {
         // An attacker embeds a newline to break out of the quoted string and inject
         // a new S-expression. This must be rejected, not silently altered.
@@ -907,6 +1104,13 @@ mod tests {
 
         assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
         assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
+        // Modern keychain daemon (macOS 13 Ventura+)
+        assert!(
+            profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
+        );
+        // Modern security daemon (macOS 10.10+)
+        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
+        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
     }
 
     #[test]
@@ -926,17 +1130,22 @@ mod tests {
 
         assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
         assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
+        assert!(
+            !profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
+        );
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
     }
 
     #[test]
-    fn test_generate_profile_keeps_keychain_mach_deny_for_non_login_keychain_paths() {
+    fn test_generate_profile_skips_keychain_mach_deny_for_metadata_keychain_db() {
         let mut caps = CapabilitySet::new();
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/test".to_string());
-        let other_keychain_file =
+        let metadata_keychain_db =
             PathBuf::from(home).join("Library/Keychains/metadata.keychain-db");
         caps.add_fs(FsCapability {
-            original: other_keychain_file.clone(),
-            resolved: other_keychain_file,
+            original: metadata_keychain_db.clone(),
+            resolved: metadata_keychain_db,
             access: AccessMode::Read,
             is_file: true,
             source: CapabilitySource::Profile,
@@ -944,8 +1153,13 @@ mod tests {
 
         let profile = generate_profile(&caps).unwrap();
 
-        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
-        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
+        assert!(
+            !profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
+        );
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
     }
 
     #[test]
@@ -958,7 +1172,14 @@ mod tests {
         // Should allow only localhost TCP to proxy port
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:54321\"))"));
         // Should allow system-socket for TCP connect
-        assert!(profile.contains("(allow system-socket)"));
+        assert!(profile.contains("(allow system-socket"));
+        // Should allow DNS via mDNSResponder Unix socket (#588)
+        assert!(
+            profile.contains("(allow network-outbound (path \"/private/var/run/mDNSResponder\"))")
+        );
+        assert!(profile.contains("(allow network-outbound (path \"/var/run/mDNSResponder\"))"));
+        assert!(profile
+            .contains("(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))"));
         // Should NOT have general outbound allow
         assert!(!profile.contains("(allow network-outbound)\n"));
         // Should NOT have bind/inbound without bind_ports
@@ -976,7 +1197,12 @@ mod tests {
         // Should allow only localhost TCP to proxy port
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:54321\"))"));
         // Should allow system-socket for TCP connect
-        assert!(profile.contains("(allow system-socket)"));
+        assert!(profile.contains("(allow system-socket"));
+        // Should allow DNS via mDNSResponder Unix socket (#588)
+        assert!(
+            profile.contains("(allow network-outbound (path \"/private/var/run/mDNSResponder\"))")
+        );
+        assert!(profile.contains("(allow network-outbound (path \"/var/run/mDNSResponder\"))"));
         // Should have bind and inbound allowed (blanket, since Seatbelt can't filter by port)
         assert!(profile.contains("(allow network-bind)"));
         assert!(profile.contains("(allow network-inbound)"));
@@ -993,6 +1219,119 @@ mod tests {
         assert!(profile.contains("(allow network-inbound)"));
         assert!(profile.contains("(allow network-bind)"));
         assert!(!profile.contains("(deny network*)"));
+    }
+
+    /// Regression test for #687: Unix domain socket paths explicitly granted via
+    /// --allow-file must remain reachable in ProxyOnly and Blocked modes.
+    /// On macOS, connect(2) to a Unix socket is classified as network-outbound by
+    /// Seatbelt, so (deny network*) blocks it unless a per-path rule is emitted.
+    #[test]
+    fn test_generate_profile_unix_socket_allowed_in_proxy_only_mode() {
+        let mut caps = CapabilitySet::new().proxy_only(54321);
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/tmp/test.sock"),
+            resolved: PathBuf::from("/private/tmp/test.sock"),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::User,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        // Must deny all network and then allow the proxy port
+        assert!(profile.contains("(deny network*)"));
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:54321\"))"));
+        // Must allow outbound to the Unix socket path (both original and resolved)
+        assert!(
+            profile.contains("(allow network-outbound (path \"/private/tmp/test.sock\"))"),
+            "must allow network-outbound to resolved socket path"
+        );
+        assert!(
+            profile.contains("(allow network-outbound (path \"/tmp/test.sock\"))"),
+            "must allow network-outbound to original (symlink) socket path"
+        );
+    }
+
+    #[test]
+    fn test_generate_profile_unix_socket_allowed_in_blocked_mode() {
+        let mut caps = CapabilitySet::new().block_network();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/var/run/app.sock"),
+            resolved: PathBuf::from("/private/var/run/app.sock"),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::User,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(deny network*)"));
+        assert!(
+            profile.contains("(allow network-outbound (path \"/private/var/run/app.sock\"))"),
+            "must allow network-outbound to resolved socket path in blocked mode"
+        );
+        assert!(
+            profile.contains("(allow network-outbound (path \"/var/run/app.sock\"))"),
+            "must allow network-outbound to original socket path in blocked mode"
+        );
+        // Must NOT open up general TCP outbound
+        assert!(!profile.contains("(allow network-outbound)\n"));
+    }
+
+    #[test]
+    fn test_generate_profile_unix_socket_subpath_for_directories() {
+        // Directory capabilities should emit (subpath "...") network-outbound rules
+        // so that Unix sockets anywhere inside the directory remain reachable.
+        // e.g. --allow /var/run/ should allow connecting to /var/run/app.sock.
+        let mut caps = CapabilitySet::new().proxy_only(54321);
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/tmp/mydir"),
+            resolved: PathBuf::from("/private/tmp/mydir"),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(
+            profile.contains("(allow network-outbound (subpath \"/private/tmp/mydir\"))"),
+            "directory caps must emit subpath network-outbound rules"
+        );
+        assert!(
+            profile.contains("(allow network-outbound (subpath \"/tmp/mydir\"))"),
+            "directory caps must emit subpath rule for original (symlink) path too"
+        );
+        // Must NOT use the literal-path form for directories
+        assert!(
+            !profile.contains("(allow network-outbound (path \"/private/tmp/mydir\"))"),
+            "directories must not use (path ...) — that is for literal file sockets"
+        );
+    }
+
+    #[test]
+    fn test_generate_profile_unix_socket_rules_not_emitted_in_allow_all() {
+        // AllowAll already permits all network-outbound — no per-path socket rules
+        // should be emitted (they would be redundant noise).
+        let mut caps = CapabilitySet::new(); // default = AllowAll
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/tmp/test.sock"),
+            resolved: PathBuf::from("/private/tmp/test.sock"),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::User,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(
+            profile.contains("(allow network-outbound)\n"),
+            "AllowAll must still emit blanket rule"
+        );
+        assert!(
+            !profile.contains("(allow network-outbound (path \"/private/tmp/test.sock\"))"),
+            "AllowAll must not emit per-path socket rules"
+        );
     }
 
     #[test]
@@ -1017,6 +1356,17 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_profile_signal_isolated_allows_same_sandbox() {
+        // Isolated now emits same-sandbox rules (matching Linux behaviour)
+        // to allow signaling child processes that inherited the sandbox.
+        let caps = CapabilitySet::new(); // default = Isolated
+        let profile = generate_profile(&caps).unwrap();
+        assert!(profile.contains("(allow signal (target self))"));
+        assert!(profile.contains("(allow signal (target same-sandbox))"));
+        assert!(!profile.contains("(allow signal)\n"));
+    }
+
+    #[test]
     fn test_generate_profile_signal_allow_same_sandbox() {
         use crate::capability::SignalMode;
         let caps = CapabilitySet::new().set_signal_mode(SignalMode::AllowSameSandbox);
@@ -1028,10 +1378,13 @@ mod tests {
 
     #[test]
     fn test_generate_profile_process_info_isolated() {
+        // Isolated now emits same-sandbox rules (matching Linux behaviour)
+        // instead of denying others, to allow child process health checks.
         let caps = CapabilitySet::new(); // default = Isolated
         let profile = generate_profile(&caps).unwrap();
         assert!(profile.contains("(allow process-info* (target self))"));
-        assert!(profile.contains("(deny process-info* (target others))"));
+        assert!(profile.contains("(allow process-info* (target same-sandbox))"));
+        assert!(!profile.contains("(deny process-info* (target others))"));
     }
 
     #[test]
@@ -1049,8 +1402,9 @@ mod tests {
         use crate::capability::ProcessInfoMode;
         let caps = CapabilitySet::new().set_process_info_mode(ProcessInfoMode::AllowAll);
         let profile = generate_profile(&caps).unwrap();
-        assert!(profile.contains("(allow process-info* (target self))"));
+        // AllowAll emits the wildcard rule only — no redundant (target self)
         assert!(profile.contains("(allow process-info*)\n"));
+        assert!(!profile.contains("(allow process-info* (target self))"));
         assert!(!profile.contains("(deny process-info* (target others))"));
     }
 
@@ -1091,6 +1445,13 @@ mod tests {
         assert!(profile.contains("(allow network-bind)"));
         assert!(profile.contains("(allow network-inbound)"));
         assert!(profile.contains("(allow system-socket"));
+        // Should allow DNS via mDNSResponder Unix socket (#588)
+        assert!(
+            profile.contains("(allow network-outbound (path \"/private/var/run/mDNSResponder\"))")
+        );
+        assert!(profile.contains("(allow network-outbound (path \"/var/run/mDNSResponder\"))"));
+        assert!(profile
+            .contains("(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))"));
     }
 
     #[test]
@@ -1120,5 +1481,66 @@ mod tests {
         assert!(profile.contains("(allow network-inbound)"));
         assert!(profile.contains("(allow network-bind)"));
         assert!(!profile.contains("(deny network*)"));
+    }
+
+    #[test]
+    fn test_generate_profile_dns_allowed_in_proxy_mode() {
+        // Regression test for #588: proxy mode must allow DNS resolution
+        // via the mDNSResponder Unix socket, otherwise all name resolution
+        // fails inside the sandbox.
+        let caps = CapabilitySet::new().proxy_only(12345);
+        let profile = generate_profile(&caps).unwrap();
+
+        // mDNSResponder socket must be reachable (both symlink and real path)
+        assert!(
+            profile.contains("(allow network-outbound (path \"/private/var/run/mDNSResponder\"))"),
+            "must allow mDNSResponder at canonical path"
+        );
+        assert!(
+            profile.contains("(allow network-outbound (path \"/var/run/mDNSResponder\"))"),
+            "must allow mDNSResponder at symlink path"
+        );
+        // AF_UNIX system-socket is needed to create the Unix domain socket
+        assert!(
+            profile.contains(
+                "(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))"
+            ),
+            "must allow AF_UNIX SOCK_STREAM for mDNSResponder"
+        );
+    }
+
+    #[test]
+    fn test_generate_profile_dns_allowed_in_blocked_mode() {
+        // Regression test for #588: blocked mode with (deny network*) must
+        // also allow DNS resolution via mDNSResponder.
+        let caps = CapabilitySet::new().block_network();
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(deny network*)"));
+        assert!(
+            profile.contains("(allow network-outbound (path \"/private/var/run/mDNSResponder\"))"),
+            "blocked mode must allow mDNSResponder at canonical path"
+        );
+        assert!(
+            profile.contains("(allow network-outbound (path \"/var/run/mDNSResponder\"))"),
+            "blocked mode must allow mDNSResponder at symlink path"
+        );
+        assert!(
+            profile.contains(
+                "(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))"
+            ),
+            "blocked mode must allow AF_UNIX SOCK_STREAM for mDNSResponder"
+        );
+    }
+
+    #[test]
+    fn test_generate_profile_dns_not_needed_in_allow_all() {
+        // AllowAll already permits all network — no special mDNSResponder
+        // rules needed (and none should appear since there's no deny network*).
+        let caps = CapabilitySet::new();
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(!profile.contains("(deny network*)"));
+        assert!(!profile.contains("mDNSResponder"));
     }
 }

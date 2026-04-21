@@ -36,6 +36,7 @@ See [Profiles & Groups](/cli/features/profiles-groups) for all built-in profiles
 | `nono run` | Run a command inside the sandbox (supervised, default) |
 | `nono shell` | Start an interactive shell inside the sandbox |
 | `nono wrap` | Apply sandbox and exec into command (no parent process, minimal overhead) |
+| `nono ps` / `attach` / `detach` / `stop` / `inspect` / `prune` | [Manage runtime sessions](/cli/features/session-lifecycle) - discover, reattach, inspect, stop, and clean up long-lived sessions |
 | `nono why` | Check why a path/network operation would be allowed or denied |
 | `nono rollback` | [Manage rollback sessions](/cli/features/atomic-rollbacks) - list, show, restore, verify, cleanup snapshots |
 | `nono audit` | [View audit trail](/cli/features/audit) - list and inspect past sandboxed sessions |
@@ -171,8 +172,10 @@ For setting up nono with a specific AI agent:
 
 ## Next Steps
 
+- [Developer Workflows](/cli/usage/developer-workflows) - Recommended day-to-day patterns for coding agents
 - [CLI Reference](/cli/usage/flags) - Complete flag documentation
 - [Examples](/cli/usage/examples) - Common usage patterns
+- [Session Lifecycle](/cli/features/session-lifecycle) - Live detached sessions, attach/detach, inspection, and stop flows
 - [Profiles & Groups](/cli/features/profiles-groups) - Pre-configured capability sets and composable security groups
 - [Credential Injection](/cli/features/credential-injection) - Secure API key loading from system keystore
 - [Undo & Snapshots](/cli/features/atomic-rollbacks) - Filesystem snapshots with integrity verification

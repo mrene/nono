@@ -20,12 +20,12 @@ nono run --profile claude-code -- claude
 ```
 
 <Warning>
-**macOS users:** Claude Code needs to open a browser on **first use** (e.g., for `claude /login`), you must add the `--allow-launch-services` flag:
+**macOS users:** Claude Code needs LaunchServices access when a session will need browser login. `nono` now auto-enables this for the built-in `claude-code` profile when it does not detect refresh-capable local auth. You can also pass the flag explicitly for first use or `claude /login`:
 
 ```bash
 nono run --profile claude-code --allow-launch-services -- claude
 ```
-After this initial login, you can exit and rerun without `--allow-launch-services` for better security.
+After login completes, rerun without `--allow-launch-services` if you no longer need browser-opening help for that session.
 See [OAuth2 Login](#oauth2-login) for details.
 </Warning>
 
@@ -36,8 +36,8 @@ The built-in profile provides:
 - **Read+write access** to `~/.vscode` (VS Code extensions directory)
 - **Read+write access** to the OS-specific VS Code app data directory:
   `~/Library/Application Support/Code` on macOS, `~/.config/Code` on Linux
-- **Read access** to the OS-specific Claude Code state path:
-  `~/Library/Keychains/login.keychain-db` on macOS, `~/.local/share/claude` on Linux
+- **Read+write access** to Claude Code's OS-specific credential storage:
+  macOS login keychain files required for OAuth persistence/refresh, or `~/.local/share/claude` on Linux
 - **Network access** enabled (required for Anthropic API)
 - **Interactive mode** enabled (preserves TTY for Claude's terminal UI)
 - **Automatic hook installation** for sandbox-aware error handling
@@ -94,6 +94,39 @@ nono run --profile claude-code -- claude
 
 <Note>
 Custom profiles with the same name override the built-in. Remove or rename the file to revert to the built-in profile.
+</Note>
+
+## Multiple Claude Profiles (`CLAUDE_CONFIG_DIR`)
+
+If you use multiple Claude Code configurations via the `CLAUDE_CONFIG_DIR` environment variable, you need to grant the sandbox access to the custom config directory and its sibling `.lock` directory. Claude Code creates `$CLAUDE_CONFIG_DIR.lock/` during OAuth token refresh coordination:
+
+```bash
+export CLAUDE_CONFIG_DIR=~/.claude-work
+
+nono run --profile claude-code \
+  --allow ~/.claude-work \
+  --allow ~/.claude-work.lock \
+  -- claude
+```
+
+Alternatively, create a custom profile that includes the paths:
+
+```json
+{
+  "meta": { "name": "claude-work" },
+  "extends": "claude-code",
+  "filesystem": {
+    "allow": ["$HOME/.claude-work", "$HOME/.claude-work.lock"]
+  }
+}
+```
+
+<Note>
+Do not set `CLAUDE_CONFIG_DIR` to its default value (`~/.claude`) explicitly — Claude Code treats "explicitly set" differently from "unset", which changes keychain service names and config file lookup paths. Only set it when you genuinely need a non-default location.
+</Note>
+
+<Note>
+For the default `~/.claude` config directory, no extra flags or directories are needed — the built-in profile already grants access to both `~/.claude` and `~/.claude.lock`.
 </Note>
 
 ## Security Tips
@@ -166,13 +199,13 @@ On Linux, no additional flags are needed:
 nono run --profile claude-code -- claude
 ```
 
-On macOS, enable LaunchServices temporarily for the login session:
+On macOS, `nono` auto-enables LaunchServices for the built-in `claude-code` profile when no refresh-capable local auth is detected. You can also enable it explicitly for the login session:
 
 ```bash
 nono run --profile claude-code --allow-launch-services -- claude
 ```
 
-After login completes, exit and rerun without `--allow-launch-services`.
+After login completes, rerun without `--allow-launch-services` unless you still need browser-opening help for that session.
 
 <Warning>
 `--allow-launch-services` lets the sandboxed Claude process ask macOS LaunchServices to open URLs, files, or apps for that session. Use it only for temporary login or setup flows, and prefer running it from a trusted directory.

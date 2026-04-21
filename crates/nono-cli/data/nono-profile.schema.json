@@ -79,10 +79,27 @@
       ],
       "description": "Opt-in gate for temporary direct LaunchServices opens on macOS. Must be paired with the CLI flag --allow-launch-services. Set to null to inherit from the base profile."
     },
+    "allow_gpu": {
+      "oneOf": [
+        { "type": "boolean" },
+        { "type": "null" }
+      ],
+      "description": "Opt-in gate for GPU access (Metal/IOKit on Apple Silicon macOS, render nodes on Linux). Intel Macs are not yet supported. Must be paired with the CLI flag --allow-gpu. Set to null to inherit from the base profile."
+    },
     "interactive": {
       "type": "boolean",
       "description": "Deprecated. Parsed for backward compatibility but ignored. Supervised mode preserves TTY by default.",
       "deprecated": true
+    },
+    "packs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Pack dependencies verified at launch. Each entry is a namespace/name reference to an installed pack."
+    },
+    "command_args": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Extra arguments appended to the child command at launch. Supports variable expansion (e.g. $NONO_PACKAGES)."
     }
   },
   "$defs": {
@@ -128,7 +145,8 @@
         "allowed_commands": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Commands to allow even when blocked by default policy. Applied before CLI --allow-command overrides."
+          "description": "Deprecated in v0.33.0. Startup-only command allowlist override. Not enforced for child processes; prefer resource-based controls instead.",
+          "deprecated": true
         },
         "signal_mode": {
           "oneOf": [
@@ -157,8 +175,20 @@
             { "type": "null" }
           ],
           "description": "Enable runtime capability elevation via seccomp-notify (Linux). When true, the supervisor intercepts file opens and can grant access to paths not in the initial capability set. When false, the sandbox is static."
+        },
+        "wsl2_proxy_policy": {
+          "oneOf": [
+            { "$ref": "#/$defs/Wsl2ProxyPolicy" },
+            { "type": "null" }
+          ],
+          "description": "WSL2 proxy fallback policy. Controls behavior when proxy-only network mode cannot be kernel-enforced on WSL2 (seccomp notify returns EBUSY). Default: error (refuse to run). Set to insecure_proxy to allow degraded execution where the credential proxy runs but network is not locked down."
         }
       }
+    },
+    "Wsl2ProxyPolicy": {
+      "type": "string",
+      "enum": ["error", "insecure_proxy"],
+      "description": "WSL2 proxy fallback policy. 'error' (default) refuses to run if proxy-only mode cannot be kernel-enforced. 'insecure_proxy' allows degraded execution where the credential proxy injects credentials but the sandboxed process is not prevented from bypassing the proxy."
     },
     "ProfileSignalMode": {
       "type": "string",
@@ -241,6 +271,12 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Additional deny.access paths to apply."
+        },
+        "add_deny_commands": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Deprecated in v0.33.0. Startup-only command denylist extension. Not enforced for child processes; prefer resource-based controls instead.",
+          "deprecated": true
         },
         "override_deny": {
           "type": "array",
@@ -345,9 +381,9 @@
     },
     "CustomCredentialDef": {
       "type": "object",
-      "description": "Custom credential route definition for the reverse proxy. Defines how to route requests and inject credentials for a service.",
+      "description": "Custom credential route definition for the reverse proxy. Defines how to route requests and inject credentials for a service. Must have either credential_key or auth (mutually exclusive).",
       "additionalProperties": false,
-      "required": ["upstream", "credential_key"],
+      "required": ["upstream"],
       "properties": {
         "upstream": {
           "type": "string",
@@ -355,7 +391,11 @@
         },
         "credential_key": {
           "type": "string",
-          "description": "Keystore account name for the credential (e.g., \"telegram_bot_token\"), or a 1Password op:// URI, or an apple-password:// URI."
+          "description": "Keystore account name for the credential (e.g., \"telegram_bot_token\"), or a 1Password op:// URI, or an apple-password:// URI. Mutually exclusive with auth."
+        },
+        "auth": {
+          "$ref": "#/$defs/OAuth2Config",
+          "description": "OAuth2 client_credentials configuration. When present, the proxy handles token exchange automatically. Mutually exclusive with credential_key."
         },
         "inject_mode": {
           "$ref": "#/$defs/InjectMode",
@@ -393,12 +433,64 @@
           ],
           "description": "Name of the query parameter to add or replace with the credential. Required when inject_mode is \"query_param\"."
         },
+        "proxy": {
+          "oneOf": [
+            { "$ref": "#/$defs/ProxyInjectConfig" },
+            { "type": "null" }
+          ],
+          "description": "Optional proxy-side overrides for phantom token parsing. When omitted, proxy behavior uses top-level custom credential fields."
+        },
         "env_var": {
           "oneOf": [
             { "type": "string" },
             { "type": "null" }
           ],
           "description": "Explicit environment variable name for the phantom token (e.g., \"OPENAI_API_KEY\"). Required when credential_key is a URI manager reference (op:// or apple-password://)."
+        },
+        "endpoint_rules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EndpointRule"
+          },
+          "description": "L7 endpoint rules for method+path filtering. When non-empty, only requests matching at least one rule are allowed (default-deny). When empty or absent, all endpoints are permitted.",
+          "default": []
+        },
+        "tls_ca": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Path to a PEM-encoded CA certificate file for upstream TLS. When set, the proxy trusts this CA in addition to system roots. Required for upstreams with self-signed or private CA certificates (e.g. a Kubernetes API server). Supports tilde (~) expansion."
+        },
+        "tls_client_cert": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Path to a PEM-encoded client certificate for upstream mutual TLS (mTLS). When set together with tls_client_key, the proxy presents this certificate during the TLS handshake. Required for upstreams that enforce client-certificate authentication."
+        },
+        "tls_client_key": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Path to the PEM-encoded private key corresponding to tls_client_cert. Must be set together with tls_client_cert."
+        }
+      }
+    },
+    "EndpointRule": {
+      "type": "object",
+      "description": "HTTP method+path access rule for restricting which API endpoints an agent can access through a credential route.",
+      "additionalProperties": false,
+      "required": ["method", "path"],
+      "properties": {
+        "method": {
+          "type": "string",
+          "description": "HTTP method to match (e.g., \"GET\", \"POST\") or \"*\" for any method."
+        },
+        "path": {
+          "type": "string",
+          "description": "URL path glob pattern. Uses standard glob syntax: \"*\" matches one path segment, \"**\" matches zero or more segments."
         }
       }
     },
@@ -407,6 +499,80 @@
       "enum": ["header", "url_path", "query_param", "basic_auth"],
       "description": "Credential injection mode for the reverse proxy.",
       "default": "header"
+    },
+    "ProxyInjectConfig": {
+      "type": "object",
+      "description": "Optional proxy-side overrides for phantom token parsing. These settings only affect incoming client request validation, not outbound upstream credential injection.",
+      "additionalProperties": false,
+      "properties": {
+        "inject_mode": {
+          "oneOf": [
+            { "$ref": "#/$defs/InjectMode" },
+            { "type": "null" }
+          ],
+          "description": "Override inject mode for proxy-side phantom token parsing. Falls back to parent inject_mode when omitted."
+        },
+        "inject_header": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Override header name for proxy-side header/basic_auth modes. Falls back to parent inject_header when omitted."
+        },
+        "credential_format": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Override credential format for proxy-side header mode. Falls back to parent credential_format when omitted."
+        },
+        "path_pattern": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Override path pattern for proxy-side url_path mode. Falls back to parent path_pattern when omitted."
+        },
+        "path_replacement": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Override path replacement for proxy-side url_path mode. Falls back to parent path_replacement when omitted."
+        },
+        "query_param_name": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Override query parameter name for proxy-side query_param mode. Falls back to parent query_param_name when omitted."
+        }
+      }
+    },
+    "OAuth2Config": {
+      "type": "object",
+      "description": "OAuth2 client_credentials configuration for automatic token exchange. The proxy exchanges client_id + client_secret for an access_token, caches it, and refreshes automatically before expiry.",
+      "additionalProperties": false,
+      "required": ["token_url", "client_id", "client_secret"],
+      "properties": {
+        "token_url": {
+          "type": "string",
+          "description": "Token endpoint URL (e.g., \"https://auth.example.com/oauth/token\"). Must use HTTPS, or HTTP only for loopback addresses."
+        },
+        "client_id": {
+          "type": "string",
+          "description": "Client ID — plain value or credential reference (env://, file://, op://)."
+        },
+        "client_secret": {
+          "type": "string",
+          "description": "Client secret — credential reference (env://, file://, op://)."
+        },
+        "scope": {
+          "type": "string",
+          "description": "OAuth2 scopes (space-separated). Empty or omitted means no scope parameter is sent.",
+          "default": ""
+        }
+      }
     },
     "SecretsConfig": {
       "type": "object",

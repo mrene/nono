@@ -36,9 +36,23 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   why        Check why a path or network operation would be allowed or denied
 
 \x1b[1mSESSION MANAGEMENT\x1b[0m
+  ps         List running or detached sandbox sessions
+  stop       Stop a running sandbox session
+  detach     Detach from an interactive runtime session
+  attach     Attach to a detached runtime session
+  logs       View runtime session event logs
+  inspect    Show detailed runtime session state
+  prune      Clean up old runtime session files
   rollback   Manage rollback sessions (browse, restore, cleanup)
   audit      View audit trail of sandboxed commands
   trust      Manage file trust and attestation
+
+\x1b[1mPACKS\x1b[0m
+  pull       Install a signed nono pack from the registry
+  remove     Remove an installed nono pack
+  update     Update installed nono packs
+  search     Search the registry for nono packs
+  list       List installed nono packs
 
 \x1b[1mPOLICY & PROFILES\x1b[0m
   policy     Inspect policy groups, profiles, and security rules
@@ -259,6 +273,165 @@ pub enum Commands {
 ")]
     Trust(TrustArgs),
 
+    /// List running sandboxed sessions
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono ps [flags]
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "EXAMPLES:
+    # Show running sessions
+    nono ps
+
+    # Show all sessions (including exited)
+    nono ps --all
+
+    # JSON output
+    nono ps --json
+")]
+    Ps(PsArgs),
+
+    /// Stop a running sandboxed session
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono stop [flags] <session>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "EXAMPLES:
+    # Stop a session by ID (prefix match)
+    nono stop a3f7c2
+
+    # Force stop (SIGKILL)
+    nono stop --force a3f7c2
+")]
+    Stop(StopArgs),
+
+    /// Detach from a running sandboxed session and return to the shell
+    #[command(
+        help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono detach <session>
+
+{all-args}
+{after-help}",
+        alias = "pause",
+        after_help = "EXAMPLES:
+    # Detach by session ID
+    nono detach a3f7c2
+
+    # Detach by name
+    nono detach calm-gate
+
+IN-BAND DETACH:
+    By default, press Ctrl-] then d to detach without opening a second terminal.
+    This can be changed in ~/.config/nono/config.toml:
+      [ui]
+      detach_sequence = \"ctrl-] d\"
+"
+    )]
+    Detach(DetachArgs),
+
+    /// Attach to a detached or running session from another terminal
+    #[command(
+        help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono attach <session>
+
+{all-args}
+{after-help}",
+        alias = "resume",
+        after_help = "EXAMPLES:
+    # Attach by session ID
+    nono attach a3f7c2
+
+    # Attach by name
+    nono attach calm-gate
+
+IN-BAND DETACH:
+    By default, press Ctrl-] then d to detach from the session.
+    This can be changed in ~/.config/nono/config.toml:
+      [ui]
+      detach_sequence = \"ctrl-] d\"
+"
+    )]
+    Attach(AttachArgs),
+
+    /// View event log for a session
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono logs [flags] <session>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "EXAMPLES:
+    # View recent events
+    nono logs a3f7c2
+
+    # Follow events in real-time
+    nono logs -f a3f7c2
+
+    # Show last 20 events
+    nono logs --tail 20 a3f7c2
+
+    # JSON output
+    nono logs --json a3f7c2
+")]
+    Logs(LogsArgs),
+
+    /// Show detailed information about a session
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono inspect [flags] <session>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "EXAMPLES:
+    # Inspect a session
+    nono inspect a3f7c2
+
+    # Include event log
+    nono inspect --events a3f7c2
+
+    # JSON output
+    nono inspect --json a3f7c2
+")]
+    Inspect(InspectArgs),
+
+    /// Clean up old session files
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono prune [flags]
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "EXAMPLES:
+    # Preview what would be cleaned
+    nono prune --dry-run
+
+    # Remove sessions older than 7 days
+    nono prune --older-than 7
+
+    # Keep only 10 most recent sessions
+    nono prune --keep 10
+")]
+    Prune(PruneArgs),
+
     // ── Policy & profiles ────────────────────────────────────────────────
     /// Inspect policy groups, profiles, and security rules
     #[command(subcommand_help_heading = "COMMANDS")]
@@ -302,9 +475,187 @@ pub enum Commands {
 ")]
     Profile(ProfileCmdArgs),
 
+    /// Install a signed nono pack from the registry
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono pull <namespace>/<name>[@<version>] [flags]
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono pull nono-project/claude-code
+  nono pull nono-project/claude-code@1.2.0 --registry http://localhost:3000
+  nono pull nono-project/claude-code --init
+")]
+    Pull(PullArgs),
+
+    /// Remove an installed nono pack
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono remove <namespace>/<name>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono remove nono-project/claude-code
+")]
+    Remove(RemoveArgs),
+
+    /// Update installed nono packs
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono update [<namespace>/<name>] [flags]
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono update
+  nono update nono-project/claude-code
+")]
+    Update(UpdateArgs),
+
+    /// Search the registry for nono packs
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono search <query> [flags]
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono search claude
+  nono search sandbox --json
+")]
+    Search(SearchArgs),
+
+    /// List installed nono packs
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono list --installed [flags]
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono list --installed
+  nono list --installed --json
+")]
+    List(ListArgs),
+
     /// Internal: open a URL via supervisor IPC
     #[command(hide = true)]
     OpenUrlHelper(OpenUrlHelperArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct PullArgs {
+    /// Package reference (<namespace>/<name>[@<version>])
+    pub package_ref: String,
+
+    /// Registry base URL
+    #[arg(
+        long,
+        env = "NONO_REGISTRY",
+        value_name = "URL",
+        help_heading = "OPTIONS"
+    )]
+    pub registry: Option<String>,
+
+    /// Overwrite conflicts and accept signer changes
+    #[arg(long, help_heading = "OPTIONS")]
+    pub force: bool,
+
+    /// Copy project instructions into the current directory
+    #[arg(long, help_heading = "OPTIONS")]
+    pub init: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct RemoveArgs {
+    /// Installed package reference (<namespace>/<name>)
+    pub package_ref: String,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct UpdateArgs {
+    /// Optional package reference (<namespace>/<name>)
+    pub package_ref: Option<String>,
+
+    /// Registry base URL
+    #[arg(
+        long,
+        env = "NONO_REGISTRY",
+        value_name = "URL",
+        help_heading = "OPTIONS"
+    )]
+    pub registry: Option<String>,
+
+    /// Accept signer changes
+    #[arg(long, help_heading = "OPTIONS")]
+    pub force: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct SearchArgs {
+    /// Search query
+    pub query: String,
+
+    /// Registry base URL
+    #[arg(
+        long,
+        env = "NONO_REGISTRY",
+        value_name = "URL",
+        help_heading = "OPTIONS"
+    )]
+    pub registry: Option<String>,
+
+    /// Output as JSON
+    #[arg(long, help_heading = "OPTIONS")]
+    pub json: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct ListArgs {
+    /// Show installed nono packs
+    #[arg(long, help_heading = "OPTIONS")]
+    pub installed: bool,
+
+    /// Output as JSON
+    #[arg(long, help_heading = "OPTIONS")]
+    pub json: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
 }
 
 /// Arguments for the hidden open-url-helper subcommand.
@@ -373,6 +724,15 @@ pub struct PolicyShowArgs {
     /// Show raw paths before expansion (e.g., $HOME instead of /Users/luke)
     #[arg(long)]
     pub raw: bool,
+    /// Output format: 'profile' (default) or 'manifest' (capability manifest JSON)
+    #[arg(long, value_enum, value_name = "FORMAT")]
+    pub format: Option<PolicyShowFormat>,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum PolicyShowFormat {
+    Profile,
+    Manifest,
 }
 
 #[derive(Parser, Debug)]
@@ -604,6 +964,17 @@ pub struct SandboxArgs {
     )]
     pub proxy_credential: Vec<String>,
 
+    /// Restrict a credential service to specific HTTP method+path patterns (repeatable).
+    /// Format: "SERVICE:METHOD:/path/pattern" (e.g., "github:GET:/repos/*/issues")
+    /// Use "*" for any method: "github:*:/repos/*/issues"
+    /// Patterns: "*" matches one path segment, "**" matches zero or more.
+    #[arg(
+        long = "allow-endpoint",
+        value_name = "SERVICE:METHOD:PATH",
+        help_heading = "CREDENTIALS"
+    )]
+    pub allow_endpoint: Vec<String>,
+
     /// Load credentials as env vars. For network API keys, prefer --credential
     #[arg(
         long,
@@ -624,11 +995,11 @@ pub struct SandboxArgs {
     pub env_credential_map: Vec<String>,
 
     // ── Commands ─────────────────────────────────────────────────────────
-    /// Allow a normally-blocked dangerous command (use with caution)
+    /// Deprecated startup-only command allowlist override (not child-process enforced)
     #[arg(long, value_name = "CMD", help_heading = "COMMANDS")]
     pub allow_command: Vec<String>,
 
-    /// Block an additional command beyond the default blocklist
+    /// Deprecated startup-only command denylist extension (not child-process enforced)
     #[arg(long, value_name = "CMD", help_heading = "COMMANDS")]
     pub block_command: Vec<String>,
 
@@ -647,8 +1018,26 @@ pub struct SandboxArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_launch_services: bool,
 
-    /// Configuration file path
-    #[arg(long, short = 'c', value_name = "FILE", help_heading = "OPTIONS")]
+    /// Allow GPU access (Metal/IOKit on Apple Silicon macOS, render nodes on Linux)
+    #[arg(long, help_heading = "OPTIONS")]
+    pub allow_gpu: bool,
+
+    /// Capability manifest file (JSON). A fully-resolved sandbox specification —
+    /// mutually exclusive with all other sandbox configuration flags.
+    #[arg(
+        long,
+        short = 'c',
+        value_name = "FILE",
+        conflicts_with_all = &[
+            "allow", "read", "write", "allow_file", "read_file", "write_file",
+            "profile", "override_deny", "allow_cwd",
+            "block_net", "allow_net", "network_profile", "allow_proxy",
+            "allow_bind", "allow_port", "external_proxy", "proxy_port",
+            "proxy_credential", "allow_endpoint", "env_credential", "env_credential_map",
+            "allow_command", "block_command", "allow_launch_services", "allow_gpu",
+        ],
+        help_heading = "OPTIONS"
+    )]
     pub config: Option<PathBuf>,
 
     /// Enable verbose output
@@ -767,11 +1156,11 @@ pub struct WrapSandboxArgs {
     pub env_credential_map: Vec<String>,
 
     // ── Commands ─────────────────────────────────────────────────────────
-    /// Allow a normally-blocked dangerous command (use with caution)
+    /// Deprecated startup-only command allowlist override (not child-process enforced)
     #[arg(long, value_name = "CMD", help_heading = "COMMANDS")]
     pub allow_command: Vec<String>,
 
-    /// Block an additional command beyond the default blocklist
+    /// Deprecated startup-only command denylist extension (not child-process enforced)
     #[arg(long, value_name = "CMD", help_heading = "COMMANDS")]
     pub block_command: Vec<String>,
 
@@ -790,8 +1179,25 @@ pub struct WrapSandboxArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_launch_services: bool,
 
-    /// Configuration file path
-    #[arg(long, short = 'c', value_name = "FILE", help_heading = "OPTIONS")]
+    /// Allow GPU access (Metal/IOKit on Apple Silicon macOS, render nodes on Linux)
+    #[arg(long, help_heading = "OPTIONS")]
+    pub allow_gpu: bool,
+
+    /// Capability manifest file (JSON). A fully-resolved sandbox specification —
+    /// mutually exclusive with all other sandbox configuration flags.
+    #[arg(
+        long,
+        short = 'c',
+        value_name = "FILE",
+        conflicts_with_all = &[
+            "allow", "read", "write", "allow_file", "read_file", "write_file",
+            "profile", "override_deny", "allow_cwd",
+            "block_net", "allow_bind", "allow_port",
+            "env_credential", "env_credential_map",
+            "allow_command", "block_command", "allow_launch_services", "allow_gpu",
+        ],
+        help_heading = "OPTIONS"
+    )]
     pub config: Option<PathBuf>,
 
     /// Enable verbose output
@@ -825,12 +1231,14 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             external_proxy_bypass: Vec::new(),
             proxy_port: None,
             proxy_credential: Vec::new(),
+            allow_endpoint: Vec::new(),
             env_credential: args.env_credential,
             env_credential_map: args.env_credential_map,
             allow_command: args.allow_command,
             block_command: args.block_command,
             profile: args.profile,
             allow_launch_services: args.allow_launch_services,
+            allow_gpu: args.allow_gpu,
             config: args.config,
             verbose: args.verbose,
             dry_run: args.dry_run,
@@ -843,6 +1251,12 @@ impl From<WrapSandboxArgs> for SandboxArgs {
 pub struct RunArgs {
     #[command(flatten)]
     pub sandbox: SandboxArgs,
+
+    /// Start the session without attaching the current terminal.
+    /// The supervisor keeps the sandboxed process running in the background;
+    /// use `nono attach <session>` later to inspect or interact with it.
+    #[arg(long, help_heading = "OPTIONS")]
+    pub detached: bool,
 
     // ── Rollback ──────────────────────────────────────────────────────
     /// Enable atomic rollback snapshots for the session
@@ -893,14 +1307,21 @@ pub struct RunArgs {
     pub no_diagnostics: bool,
 
     /// Disable the audit trail for this session
-    #[arg(long, conflicts_with = "rollback", help_heading = "OPTIONS")]
+    #[arg(long, help_heading = "OPTIONS")]
     pub no_audit: bool,
 
     /// Disable trust verification (not recommended for production)
     #[arg(long, help_heading = "OPTIONS")]
     pub trust_override: bool,
 
-    /// Enable runtime capability elevation (interactive prompts)
+    /// Name for this session (shown in `nono ps`)
+    #[arg(long, value_name = "NAME", help_heading = "OPTIONS")]
+    pub name: Option<String>,
+
+    /// Enable runtime capability elevation (seccomp-notify + approval prompts).
+    /// Overrides the profile's capability_elevation setting.
+    /// When enabled, the supervisor can grant access to paths not in the
+    /// initial capability set via interactive prompts.
     #[arg(long, env = "NONO_CAPABILITY_ELEVATION", help_heading = "OPTIONS")]
     pub capability_elevation: bool,
 
@@ -922,6 +1343,10 @@ pub struct ShellArgs {
     /// Shell to execute (defaults to $SHELL or /bin/sh)
     #[arg(long, value_name = "SHELL", help_heading = "OPTIONS")]
     pub shell: Option<PathBuf>,
+
+    /// Name for this session (shown in `nono ps`)
+    #[arg(long, value_name = "NAME", help_heading = "OPTIONS")]
+    pub name: Option<String>,
 
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
@@ -1292,6 +1717,94 @@ pub struct AuditShowArgs {
     pub help: Option<bool>,
 }
 
+#[derive(Parser, Debug)]
+pub struct PsArgs {
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Include exited sessions
+    #[arg(long)]
+    pub all: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct StopArgs {
+    /// Session ID (or prefix)
+    pub session: String,
+
+    /// Force stop (SIGKILL instead of SIGTERM)
+    #[arg(long)]
+    pub force: bool,
+
+    /// Grace period in seconds before SIGKILL (default: 10)
+    #[arg(long, default_value = "10")]
+    pub timeout: u64,
+}
+
+#[derive(Parser, Debug)]
+pub struct DetachArgs {
+    /// Session ID, prefix, or name
+    pub session: String,
+}
+
+#[derive(Parser, Debug)]
+pub struct AttachArgs {
+    /// Session ID, prefix, or name
+    pub session: String,
+}
+
+#[derive(Parser, Debug)]
+pub struct LogsArgs {
+    /// Session ID (or prefix)
+    pub session: String,
+
+    /// Follow events in real-time
+    #[arg(long, short = 'f')]
+    pub follow: bool,
+
+    /// Show last N events
+    #[arg(long, value_name = "N")]
+    pub tail: Option<usize>,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct InspectArgs {
+    /// Session ID (or prefix)
+    pub session: String,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Include event log
+    #[arg(long)]
+    pub events: bool,
+
+    /// Include file changes
+    #[arg(long)]
+    pub changes: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct PruneArgs {
+    /// Show what would be removed without deleting
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Remove sessions older than N days
+    #[arg(long, value_name = "DAYS")]
+    pub older_than: Option<u64>,
+
+    /// Keep only the N most recent sessions
+    #[arg(long, value_name = "N")]
+    pub keep: Option<usize>,
+}
+
 // ---------------------------------------------------------------------------
 // Trust command args
 // ---------------------------------------------------------------------------
@@ -1337,11 +1850,15 @@ pub struct TrustSignArgs {
     pub all: bool,
 
     /// Key ID to use from the system keystore (default: "default")
-    #[arg(long, value_name = "KEY_ID", conflicts_with = "keyless")]
+    #[arg(long, value_name = "KEY_ID", conflicts_with_all = ["keyless", "keyref"])]
     pub key: Option<String>,
 
+    /// Key reference URI (keystore://name or file:///path/to/key.pem)
+    #[arg(long, value_name = "URI", conflicts_with_all = ["key", "keyless"])]
+    pub keyref: Option<String>,
+
     /// Use Sigstore keyless signing (Fulcio + Rekor via ambient OIDC)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "keyref")]
     pub keyless: bool,
 
     /// Produce a single .nono-trust.bundle containing all subjects instead of per-file bundles
@@ -1365,8 +1882,12 @@ pub struct TrustSignPolicyArgs {
     pub file: Option<PathBuf>,
 
     /// Key ID to use from the system keystore (default: "default")
-    #[arg(long, value_name = "KEY_ID")]
+    #[arg(long, value_name = "KEY_ID", conflicts_with = "keyref")]
     pub key: Option<String>,
+
+    /// Key reference URI (keystore://name or file:///path/to/key.pem)
+    #[arg(long, value_name = "URI", conflicts_with = "key")]
+    pub keyref: Option<String>,
 
     /// Sign the user-level trust policy at ~/.config/nono/trust-policy.json
     #[arg(long)]
@@ -1405,8 +1926,12 @@ pub struct TrustInitArgs {
     pub include: Vec<String>,
 
     /// Key ID to include as a publisher (default: "default")
-    #[arg(long, value_name = "KEY_ID")]
+    #[arg(long, value_name = "KEY_ID", conflicts_with = "keyref")]
     pub key: Option<String>,
+
+    /// Key reference URI (keystore://name or file:///path/to/key.pem)
+    #[arg(long, value_name = "URI", conflicts_with = "key")]
+    pub keyref: Option<String>,
 
     /// Create a user-level policy at ~/.config/nono/ instead of the current directory
     #[arg(long)]
@@ -1441,8 +1966,17 @@ pub struct TrustListArgs {
 #[command(disable_help_flag = true)]
 pub struct TrustKeygenArgs {
     /// Key identifier (stored in system keystore under this name)
-    #[arg(long, value_name = "NAME", default_value = "default")]
+    #[arg(
+        long,
+        value_name = "NAME",
+        default_value = "default",
+        conflicts_with = "keyref"
+    )]
     pub id: String,
+
+    /// Key reference URI (keystore://name or file:///path/to/key.pem)
+    #[arg(long, value_name = "URI", conflicts_with = "id")]
+    pub keyref: Option<String>,
 
     /// Overwrite existing key with the same ID
     #[arg(long)]
@@ -1457,8 +1991,17 @@ pub struct TrustKeygenArgs {
 #[command(disable_help_flag = true)]
 pub struct TrustExportKeyArgs {
     /// Key identifier to export (default: "default")
-    #[arg(long, value_name = "NAME", default_value = "default")]
+    #[arg(
+        long,
+        value_name = "NAME",
+        default_value = "default",
+        conflicts_with = "keyref"
+    )]
     pub id: String,
+
+    /// Key reference URI (keystore://name or file:///path/to/key.pem)
+    #[arg(long, value_name = "URI", conflicts_with = "id")]
+    pub keyref: Option<String>,
 
     /// Output as PEM instead of base64 DER
     #[arg(long)]
@@ -2168,6 +2711,34 @@ mod tests {
     }
 
     #[test]
+    fn test_allow_endpoint_flag_parses() {
+        let cli = Cli::parse_from([
+            "nono",
+            "run",
+            "--allow",
+            ".",
+            "--credential",
+            "github",
+            "--allow-endpoint",
+            "github:GET:/repos/*/issues",
+            "--allow-endpoint",
+            "github:POST:/repos/*/issues/*/comments",
+            "echo",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.sandbox.allow_endpoint.len(), 2);
+                assert_eq!(args.sandbox.allow_endpoint[0], "github:GET:/repos/*/issues");
+                assert_eq!(
+                    args.sandbox.allow_endpoint[1],
+                    "github:POST:/repos/*/issues/*/comments"
+                );
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
     fn test_override_deny_single() {
         let cli = Cli::parse_from([
             "nono",
@@ -2378,8 +2949,9 @@ mod tests {
     /// All subcommand names that must appear in the root help template.
     /// If you add a new command to the `Commands` enum, add it here too.
     const ALL_SUBCOMMANDS: &[&str] = &[
-        "setup", "run", "shell", "wrap", "learn", "why", "rollback", "audit", "trust", "policy",
-        "profile",
+        "setup", "run", "shell", "wrap", "learn", "why", "ps", "stop", "detach", "attach", "logs",
+        "inspect", "prune", "rollback", "audit", "trust", "policy", "profile", "pull", "remove",
+        "update", "search", "list",
     ];
 
     #[test]

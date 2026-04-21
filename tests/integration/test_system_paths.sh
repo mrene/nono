@@ -121,6 +121,19 @@ if is_linux; then
 
         expect_failure "cannot read foreign /proc/1/maps" \
             "$NONO_BIN" run --allow "$TMPDIR" -- cat /proc/1/maps >/dev/null
+
+        # Regression test for issue #602: grandchild proc/self access.
+        # When bun (or any runtime) is launched via `sh -c`, it is a grandchild
+        # (nono→sh→bun). The supervisor must resolve /proc/self using the
+        # grandchild's TGID, not the direct child (sh)'s PID.
+        if command -v bun >/dev/null 2>&1; then
+            BUN_BIN=$(command -v bun)
+            BUN_DIR=$(dirname "$BUN_BIN")
+            expect_success "grandchild bun can read /proc/self via sh wrapper (issue #602)" \
+                "$NONO_BIN" run --allow "$TMPDIR" --read "$BUN_DIR" -- sh -c "$BUN_BIN -e 'process.exit(0)'"
+        else
+            skip_test "grandchild bun /proc/self access (issue #602)" "bun not installed"
+        fi
     fi
 
     if [[ -d /sys ]]; then

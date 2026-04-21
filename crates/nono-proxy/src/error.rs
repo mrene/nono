@@ -36,6 +36,9 @@ pub enum ProxyError {
     #[error("HTTP parse error: {0}")]
     HttpParse(String),
 
+    #[error("OAuth2 token exchange error: {0}")]
+    OAuth2Exchange(String),
+
     #[error("Proxy shutdown")]
     Shutdown,
 

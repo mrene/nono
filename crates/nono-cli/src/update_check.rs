@@ -370,11 +370,14 @@ mod tests {
 
     #[test]
     fn test_env_var_opt_out() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         // When NONO_NO_UPDATE_CHECK is set, start_background_check returns None
-        std::env::set_var("NONO_NO_UPDATE_CHECK", "1");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("NONO_NO_UPDATE_CHECK", "1")]);
         let handle = start_background_check();
         assert!(handle.is_none());
-        std::env::remove_var("NONO_NO_UPDATE_CHECK");
     }
 
     #[test]

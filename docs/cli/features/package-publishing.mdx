@@ -1,0 +1,364 @@
+---
+title: Pack Publishing Setup
+description: End-to-end setup for nono packs, trusted publishing, and the GitHub Action
+---
+
+<Warning>
+  This feature is coming soon and is not yet available.
+</Warning>
+
+This guide is the producer-side setup for nono packs. It covers pack layout, trusted publisher registration, GitHub Actions publishing, and the checks `nono pull` performs on the consumer side.
+
+`Nono packs` is the umbrella term for two pack types:
+
+- `agent packs`: profiles, hooks, `SKILL.md`, instructions, config, helper scripts, and related setup assets.
+- `policy packs`: trust policy, groups, and other enforcement-oriented bundles.
+
+<Tip>
+  For the trust model behind this flow, see [Agent Instruction Attestation](/cli/features/trust).
+</Tip>
+
+## Before You Start
+
+You need four things in place before publishing works:
+
+1. A pack created in the registry.
+2. A pack namespace that matches the GitHub org that will publish it.
+3. A trusted publisher entry for the exact repository and workflow.
+4. A GitHub Actions workflow with `permissions: id-token: write`.
+
+Namespace binding is enforced. If your pack is `acme-corp/claude-code`, the publishing repository must be under `acme-corp/*`.
+
+## Step 1: Create the Pack Directory
+
+An agent pack is a signed bundle of agent-facing artifacts. Today the CLI supports these artifact types:
+
+- `profile`
+- `hook`
+- `instruction`
+- `trust_policy`
+- `groups`
+- `script`
+
+A minimal pack directory might look like this:
+
+```text
+packages/claude-code/
+├── package.json
+├── claude-code.profile.json
+├── CLAUDE.md
+├── hooks/
+│   └── nono-hook.sh
+├── groups.json
+└── trust-policy.json
+```
+
+The registry publishes raw files. The local install behavior comes from `package.json`.
+
+## Step 2: Write `package.json`
+
+`package.json` is required. `nono pull` will fail if it is not present in the published artifact set.
+
+Example:
+
+```json
+{
+  "schema_version": 1,
+  "name": "claude-code",
+  "pack_type": "agent",
+  "description": "Sandbox profile, hooks, and trust policy for Claude Code",
+  "license": "Apache-2.0",
+  "platforms": ["macos", "linux"],
+  "min_nono_version": "0.19.0",
+  "artifacts": [
+    {
+      "type": "profile",
+      "path": "claude-code.profile.json",
+      "install_as": "claude-code"
+    },
+    {
+      "type": "hook",
+      "path": "hooks/nono-hook.sh",
+      "target": "claude-code",
+      "install_dir": "~/.claude/hooks"
+    },
+    {
+      "type": "instruction",
+      "path": "CLAUDE.md",
+      "placement": "project"
+    },
+    {
+      "type": "groups",
+      "path": "groups.json",
+      "prefix": "claude_code"
+    },
+    {
+      "type": "trust_policy",
+      "path": "trust-policy.json",
+      "merge_strategy": "additive"
+    }
+  ]
+}
+```
+
+Important constraints:
+
+- `name` should match the pack name in the registry.
+- Every `artifacts[].path` must exactly match an uploaded filename.
+- `profile` artifacts need `install_as`.
+- `groups` artifacts need `prefix`.
+- `instruction` artifacts with `placement: "project"` are copied into the current working directory when users run `nono pull --init`.
+
+## Step 3: Create the Pack in the Registry
+
+Create the pack in the registry UI first. You will need:
+
+- Pack name
+- Description
+- Kind
+- Source GitHub repository
+- Optional repo subpath if the pack lives below the repo root
+
+After the pack exists, configure trusted publishing for it.
+
+## Step 4: Register a Trusted Publisher
+
+Trusted publishing binds a package to a GitHub Actions identity. The registry checks:
+
+- Repository
+- Workflow path
+- Git ref pattern
+- Optional GitHub environment
+
+For `acme-corp/claude-code`, a typical trusted publisher configuration is:
+
+| Field | Example |
+|-------|---------|
+| Repository | `acme-corp/nono-policies` |
+| Workflow | `.github/workflows/publish.yml` |
+| Ref pattern | `refs/tags/v*` |
+| Environment | `production` or empty |
+
+The registry rejects:
+
+- Repositories outside the pack namespace org
+- Workflows outside `.github/workflows/*.yml`
+- OIDC identities that do not match the registered publisher
+- Bundles whose repository or workflow differs from the trusted publisher
+
+If you are calling the API directly, the publisher payload is:
+
+```json
+{
+  "repository": "acme-corp/nono-policies",
+  "workflow": ".github/workflows/publish.yml",
+  "ref_pattern": "refs/tags/v*",
+  "environment": "production"
+}
+```
+
+The endpoint is:
+
+```text
+POST /api/v1/packages/{namespace}/{name}/publishers
+```
+
+This requires an authenticated session with 2FA on the registry side.
+
+## Step 5: Add the GitHub Actions Workflow
+
+The reference implementation lives in the registry repository at `action/action.yml` and is published as `agent-sign`.
+
+At a high level the action:
+
+1. Installs the `nono` CLI.
+2. Signs each selected artifact with `nono trust sign --keyless`.
+3. Requests a GitHub OIDC token with audience `nono-registry`.
+4. Exchanges that token for a short-lived registry upload token.
+5. Uploads the artifacts and matching `.bundle` sidecars.
+
+Example workflow:
+
+```yaml
+name: Publish nono package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish package
+        uses: <registry-repo>/action@main
+        with:
+          package-name: claude-code
+          package-namespace: acme-corp
+          version: ${{ github.ref_name }}
+          path: packages/claude-code
+          files: |
+            package.json
+            claude-code.profile.json
+            CLAUDE.md
+            hooks/nono-hook.sh
+            groups.json
+            trust-policy.json
+```
+
+Replace `<registry-repo>` with the repository that publishes the action. The current action source lives in `nono-registry/action/`.
+
+### Required Workflow Permissions
+
+You must grant:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+```
+
+Without `id-token: write`, GitHub will not mint the OIDC token and the publish step will fail before upload.
+
+## Step 6: Configure Action Inputs
+
+The action accepts these inputs:
+
+| Input | Required | Purpose |
+|-------|----------|---------|
+| `package-name` | yes | Registry package name |
+| `package-namespace` | yes | Namespace or org |
+| `version` | yes | Version string to publish |
+| `path` | no | Directory containing the package files |
+| `files` | no | Whitespace-separated file list to sign and upload |
+| `registry-url` | no | API base, defaults to `https://registry.nono.sh/api/v1` |
+| `nono-version` | no | CLI version to install |
+
+Recommended practice:
+
+- Set `path` to the pack directory.
+- Set `files` explicitly.
+- Publish from tags and register `ref_pattern: refs/tags/v*`.
+
+### Why `files` Should Usually Be Explicit
+
+If `files` is omitted, the current action auto-discovers only non-hidden top-level files under `path`. That means nested files such as `hooks/nono-hook.sh` are not picked up automatically.
+
+Use `files:` whenever your package contains subdirectories.
+
+## Step 7: Understand the Trust-Publishing Handshake
+
+The action does not use a long-lived registry secret. The flow is:
+
+1. GitHub issues an OIDC token for the workflow run.
+2. The action posts that token to:
+
+```text
+POST {registry-url}/auth/oidc/exchange
+```
+
+with:
+
+```json
+{
+  "token": "<github-oidc-token>",
+  "package_namespace": "acme-corp",
+  "package_name": "claude-code"
+}
+```
+
+3. The registry validates the GitHub identity against the trusted publisher entry.
+4. The registry returns a short-lived upload token.
+5. The action uploads the version to:
+
+```text
+POST {registry-url}/packages/{namespace}/{name}/versions
+```
+
+This is the core trust-publishing property: GitHub attests who ran the workflow, the registry authorizes that exact identity, and the client later verifies the Sigstore bundle locally.
+
+## Step 8: Publish a Version
+
+Once the workflow is merged:
+
+1. Create a tag such as `v1.2.0`.
+2. Push it to GitHub.
+3. Wait for the publish workflow to complete.
+4. Confirm the new version appears in the registry.
+
+If you publish from a branch instead of a tag, make sure the trusted publisher `ref_pattern` matches that branch ref, for example `refs/heads/main`.
+
+## Step 9: Verify the Consumer Path
+
+Test the package with `nono pull`:
+
+```bash
+nono pull acme-corp/claude-code
+```
+
+For a dev registry:
+
+```bash
+nono pull --registry http://localhost:3001/api/v1 acme-corp/claude-code
+```
+
+On pull, the CLI:
+
+1. Fetches the pull manifest from the registry.
+2. Downloads artifacts and matching `.bundle` files.
+3. Verifies Sigstore bundles locally.
+4. Verifies the signer repository org matches the pack namespace.
+5. Pins signer identity in the local pack lockfile.
+6. Installs verified artifacts into the local pack store.
+
+This matters operationally: the registry is part of the distribution path, but the trust decision is made from the signed bundle and publisher identity.
+
+## Troubleshooting
+
+### Publisher registration fails
+
+Check:
+
+- The repository is in `owner/repo` format.
+- The owner matches the pack namespace.
+- The workflow path is under `.github/workflows/`.
+- Your registry session has 2FA enabled and verified.
+
+### OIDC exchange fails
+
+Check:
+
+- `permissions: id-token: write` is present.
+- The workflow path matches the trusted publisher exactly.
+- The repository matches the trusted publisher exactly.
+- The tag or branch ref matches `ref_pattern`.
+- The GitHub environment matches if one was configured.
+
+### Publish succeeds but `nono pull` fails
+
+Check:
+
+- `package.json` was included in the uploaded files.
+- Uploaded filenames exactly match the `package.json` artifact paths.
+- Nested files were listed explicitly in `files:`.
+- Group names respect the configured prefix.
+- `min_nono_version` is not higher than the installed CLI version.
+
+## Recommended Release Pattern
+
+The cleanest setup is:
+
+1. Keep the package in a dedicated directory in the publishing repository.
+2. Register one trusted publisher per workflow.
+3. Publish immutable releases from tags such as `v1.2.0`.
+4. Use `refs/tags/v*` as the trusted publisher ref pattern.
+5. Validate every release with a fresh `nono pull` against the intended registry.
+
+That gives consumers a straight provenance chain from installed artifacts back to a specific repository, workflow, and Git ref.

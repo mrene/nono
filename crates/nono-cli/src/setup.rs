@@ -196,6 +196,26 @@ impl SetupRunner {
 
         println!("  * Filesystem ruleset creation verified");
 
+        // WSL2 environment detection and feature matrix
+        if nono::sandbox::is_wsl2() {
+            println!("  * WSL2 environment detected");
+            println!(
+                "    - Filesystem sandbox: available (Landlock {})",
+                detected.version_string()
+            );
+            println!("    - Block-all network (--block-net): available");
+            if detected.has_network() {
+                println!("    - Per-port network filtering: available (Landlock V4+)");
+            } else {
+                println!("    - Per-port network filtering: unavailable (needs kernel 6.7+ for Landlock V4)");
+            }
+            println!(
+                "    - Credential proxy (--credential): requires wsl2_proxy_policy profile opt-in"
+            );
+            println!("    - Capability elevation (--capability-elevation): unavailable");
+            println!("    Note: seccomp user notification returns EBUSY (microsoft/WSL#9548)");
+        }
+
         if detected.has_network() {
             if verify_landlock_network_rule_support(detected.abi)? {
                 println!("  * TCP network rule support verified");
@@ -486,7 +506,6 @@ const DATA_PROCESSING_PROFILE: &str = r#"{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
     use tempfile::tempdir;
 
     /// Profiles written by `setup --profiles` must be loadable by `load_profile()`.
@@ -498,15 +517,22 @@ mod tests {
     /// `resolve_user_config_dir()` returning `~/.config`. This test catches that.
     #[test]
     fn test_setup_profiles_loadable_by_name() {
-        let original_home = env::var("HOME").ok();
-        let original_xdg = env::var("XDG_CONFIG_HOME").ok();
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
 
         let tmp = tempdir().expect("tempdir");
 
         // Point HOME at a tmpdir so both setup and loader derive paths
-        // under our control.
-        env::set_var("HOME", tmp.path());
-        env::remove_var("XDG_CONFIG_HOME");
+        // under our control. Set XDG_CONFIG_HOME to a placeholder so
+        // EnvVarGuard captures its original value, then remove it so the
+        // loader falls back to HOME-based resolution.
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", tmp.path().to_str().expect("tmp path")),
+            ("XDG_CONFIG_HOME", "__placeholder__"),
+        ]);
+        _env.remove("XDG_CONFIG_HOME");
 
         // Run the actual setup code that writes example profiles.
         let runner = SetupRunner {
@@ -521,16 +547,6 @@ mod tests {
         let profile = crate::profile::load_profile("example-agent")
             .expect("example-agent profile written by setup was not found by load_profile()");
         assert_eq!(profile.meta.name, "example-agent");
-
-        // Restore env vars to avoid polluting parallel tests.
-        if let Some(home) = original_home {
-            env::set_var("HOME", home);
-        } else {
-            env::remove_var("HOME");
-        }
-        if let Some(xdg) = original_xdg {
-            env::set_var("XDG_CONFIG_HOME", xdg);
-        }
     }
 
     #[cfg(target_os = "linux")]

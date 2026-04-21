@@ -183,8 +183,8 @@
         "/tmp": "/private/tmp"
       }
     },
-    "system_read_linux": {
-      "description": "Linux system paths required for executables to function",
+    "system_read_linux_core": {
+      "description": "Linux core system paths required for normal CLI execution",
       "platform": "linux",
       "allow": {
         "read": [
@@ -245,12 +245,35 @@
           "/proc/stat",
           "/proc/loadavg",
           "/proc/version",
-          "/proc/filesystems",
-          "/sys",
+          "/proc/filesystems"
+        ]
+      }
+    },
+    "linux_runtime_state": {
+      "description": "Linux runtime state paths for host session and service integration",
+      "platform": "linux",
+      "allow": {
+        "read": [
           "/run",
-          "/var/run",
-          "/tmp",
-          "/nix"
+          "/var/run"
+        ]
+      }
+    },
+    "linux_sysfs_read": {
+      "description": "Linux sysfs paths for kernel and device state inspection",
+      "platform": "linux",
+      "allow": {
+        "read": [
+          "/sys"
+        ]
+      }
+    },
+    "linux_temp_read": {
+      "description": "Linux shared temporary directory read access",
+      "platform": "linux",
+      "allow": {
+        "read": [
+          "/tmp"
         ]
       }
     },
@@ -301,14 +324,11 @@
       }
     },
     "user_caches_linux": {
-      "description": "User cache and log directories for Linux programs (XDG)",
+      "description": "User cache directories for Linux programs (XDG)",
       "platform": "linux",
       "allow": {
         "readwrite": [
           "~/.cache"
-        ],
-        "read": [
-          "~/.local/state"
         ]
       }
     },
@@ -330,9 +350,6 @@
           "~/.local/share/man",
           "~/.local/share/bash-completion",
           "~/.local/share/zsh"
-        ],
-        "readwrite": [
-          "~/.local/state"
         ]
       }
     },
@@ -389,8 +406,8 @@
         ]
       }
     },
-    "homebrew": {
-      "description": "Homebrew installation paths",
+    "homebrew_macos": {
+      "description": "Homebrew installation paths on macOS",
       "platform": "macos",
       "allow": {
         "read": [
@@ -400,12 +417,22 @@
         ]
       }
     },
+    "homebrew_linux": {
+      "description": "Homebrew (Linuxbrew) installation paths on Linux",
+      "platform": "linux",
+      "allow": {
+        "read": [
+          "/home/linuxbrew/.linuxbrew"
+        ]
+      }
+    },
     "claude_code_macos": {
       "description": "Claude Code macOS-specific state and credential paths",
       "platform": "macos",
       "allow": {
-        "read": [
-          "$HOME/Library/Keychains/login.keychain-db"
+        "readwrite": [
+          "$HOME/Library/Keychains/login.keychain-db",
+          "$HOME/Library/Keychains/metadata.keychain-db"
         ]
       }
     },
@@ -422,8 +449,9 @@
       "description": "Codex macOS-specific state and credential paths",
       "platform": "macos",
       "allow": {
-        "read": [
-          "$HOME/Library/Keychains/login.keychain-db"
+        "readwrite": [
+          "$HOME/Library/Keychains/login.keychain-db",
+          "$HOME/Library/Keychains/metadata.keychain-db"
         ]
       }
     },
@@ -456,7 +484,8 @@
           "~/.nix-defexpr",
           "/run/current-system/sw",
           "/etc/profiles/per-user",
-          "/nix/var/nix/profiles"
+          "/nix/var/nix/profiles",
+          "/nix/store"
         ]
       }
     },
@@ -466,7 +495,9 @@
         "read": [
           "$HOME/.gitconfig",
           "$HOME/.gitignore_global",
-          "$HOME/.config/git/ignore"
+          "$HOME/.config/git/config",
+          "$HOME/.config/git/ignore",
+          "$HOME/.config/git/attributes"
         ]
       }
     },
@@ -521,6 +552,18 @@
         ]
       }
     },
+    "deny_socket_paths_linux": {
+      "description": "Block privileged Unix domain sockets that could allow sandbox escape (Linux seccomp enforcement)",
+      "required": true,
+      "platform": "linux",
+      "deny": {
+        "sockets": [
+          "/run/docker.sock",
+          "/var/run/docker.sock",
+          "/run/dbus/system_bus_socket"
+        ]
+      }
+    },
     "dangerous_commands_linux": {
       "description": "Linux-specific commands blocked by default",
       "platform": "linux",
@@ -569,14 +612,37 @@
           "deny_shell_history",
           "deny_shell_configs",
           "system_read_macos",
-          "system_read_linux",
+          "system_read_linux_core",
           "system_write_macos",
           "system_write_linux",
           "user_tools",
-          "homebrew",
+          "homebrew_macos",
+          "homebrew_linux",
           "dangerous_commands",
           "dangerous_commands_macos",
-          "dangerous_commands_linux"
+          "dangerous_commands_linux",
+          "deny_socket_paths_linux"
+        ],
+        "signal_mode": "isolated"
+      },
+      "filesystem": {},
+      "network": { "block": false },
+      "workdir": { "access": "none" },
+      "interactive": false
+    },
+    "linux-host-compat": {
+      "extends": "default",
+      "meta": {
+        "name": "linux-host-compat",
+        "version": "1.0.0",
+        "description": "Linux compatibility profile for host runtime, sysfs, and temp access",
+        "author": "nono-project"
+      },
+      "security": {
+        "groups": [
+          "linux_runtime_state",
+          "linux_sysfs_read",
+          "linux_temp_read"
         ],
         "signal_mode": "isolated"
       },
@@ -604,6 +670,7 @@
           "python_runtime",
           "vscode_macos",
           "vscode_linux",
+          "linux_sysfs_read",
           "nix_runtime",
           "git_config",
           "unlink_protection"
@@ -612,8 +679,11 @@
         "capability_elevation": false
       },
       "filesystem": {
-        "allow": ["$HOME/.claude"],
-        "allow_file": ["$HOME/.claude.json", "$HOME/.claude.json.lock"]
+        "allow": ["$HOME/.claude", "$HOME/.cache/claude", "$HOME/.claude.lock", "$XDG_CONFIG_HOME/nono/profiles"],
+        "allow_file": [
+          "$HOME/.claude.json",
+          "$HOME/.claude.json.lock"
+        ]
       },
       "network": { "block": false },
       "workdir": { "access": "readwrite" },
@@ -624,13 +694,6 @@
         "allow_localhost": true
       },
       "allow_launch_services": true,
-      "hooks": {
-        "claude-code": {
-          "event": "PostToolUseFailure",
-          "matcher": "Read|Write|Edit|Bash",
-          "script": "nono-hook.sh"
-        }
-      },
       "undo": {
         "exclude_patterns": ["node_modules", ".next", "__pycache__", "target"],
         "exclude_globs": ["*.tmp.[0-9]*.[0-9]*"]
@@ -651,6 +714,7 @@
           "node_runtime",
           "rust_runtime",
           "python_runtime",
+          "linux_sysfs_read",
           "nix_runtime",
           "git_config",
           "unlink_protection"
@@ -688,7 +752,6 @@
         "allow": [
           "$HOME/.openclaw",
           "$HOME/.config/openclaw",
-          "$HOME/.local",
           "$TMPDIR/openclaw-$UID"
         ]
       },
@@ -708,7 +771,7 @@
         "author": "nono-project"
       },
       "security": {
-        "groups": ["user_caches_macos", "user_caches_linux", "node_runtime", "opencode_linux", "git_config", "unlink_protection"],
+        "groups": ["user_caches_macos", "user_caches_linux", "node_runtime", "opencode_linux", "linux_sysfs_read", "git_config", "unlink_protection"],
         "signal_mode": "isolated"
       },
       "filesystem": {
@@ -717,7 +780,9 @@
           "$HOME/.config/opencode",
           "$HOME/.cache/opencode",
           "$HOME/.local/share/opencode",
-          "$HOME/.local/share/opentui"
+          "$HOME/.local/share/opentui",
+          "$HOME/.local/state/opencode",
+          "$TMPDIR"
         ]
       },
       "network": { "block": false },
@@ -810,6 +875,7 @@
           "node_runtime",
           "user_caches_macos",
           "user_caches_linux",
+          "linux_sysfs_read",
           "git_config",
           "unlink_protection"
         ],

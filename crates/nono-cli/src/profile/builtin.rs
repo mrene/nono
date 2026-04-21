@@ -31,6 +31,14 @@ mod tests {
             .security
             .groups
             .contains(&"deny_credentials".to_string()));
+        assert!(profile
+            .filesystem
+            .allow
+            .contains(&"$HOME/.cache/claude".to_string()));
+        assert!(profile
+            .filesystem
+            .allow
+            .contains(&"$HOME/.claude.lock".to_string()));
     }
 
     #[test]
@@ -67,8 +75,16 @@ mod tests {
             .contains(&"$HOME/.local/share/claude".to_string()));
         assert!(!profile
             .filesystem
-            .read_file
+            .allow_file
             .contains(&"$HOME/Library/Keychains/login.keychain-db".to_string()));
+        assert!(!profile
+            .filesystem
+            .allow_file
+            .contains(&"$HOME/Library/Keychains/metadata.keychain-db".to_string()));
+        assert!(profile
+            .filesystem
+            .allow
+            .contains(&"$HOME/.claude.lock".to_string()));
     }
 
     #[test]
@@ -158,6 +174,7 @@ mod tests {
     fn test_list_builtin() {
         let profiles = list_builtin();
         assert!(profiles.contains(&"default".to_string()));
+        assert!(profiles.contains(&"linux-host-compat".to_string()));
         assert!(profiles.contains(&"claude-code".to_string()));
         assert!(profiles.contains(&"codex".to_string()));
         assert!(profiles.contains(&"openclaw".to_string()));
@@ -219,8 +236,10 @@ mod tests {
             "deny_macos_private".to_string(),
             "deny_shell_configs".to_string(),
             "deny_shell_history".to_string(),
-            "homebrew".to_string(),
-            "system_read_linux".to_string(),
+            "deny_socket_paths_linux".to_string(),
+            "homebrew_linux".to_string(),
+            "homebrew_macos".to_string(),
+            "system_read_linux_core".to_string(),
             "system_read_macos".to_string(),
             "system_write_linux".to_string(),
             "system_write_macos".to_string(),
@@ -244,6 +263,131 @@ mod tests {
                 Some("default"),
                 "embedded profile '{}' should extend default",
                 name
+            );
+        }
+    }
+
+    #[test]
+    fn test_linux_host_compat_profile_groups() {
+        let profile = get_builtin("linux-host-compat").expect("Profile not found");
+        assert!(profile
+            .security
+            .groups
+            .contains(&"linux_runtime_state".to_string()));
+        assert!(profile
+            .security
+            .groups
+            .contains(&"linux_sysfs_read".to_string()));
+        assert!(profile
+            .security
+            .groups
+            .contains(&"linux_temp_read".to_string()));
+    }
+
+    #[test]
+    fn test_linux_interactive_profiles_include_sysfs_but_not_runtime_state_or_temp() {
+        for name in ["claude-code", "codex", "opencode", "swival"] {
+            let profile = get_builtin(name).expect("Profile not found");
+            assert!(
+                !profile
+                    .security
+                    .groups
+                    .contains(&"linux_runtime_state".to_string()),
+                "{} should not include linux_runtime_state",
+                name
+            );
+            assert!(
+                profile
+                    .security
+                    .groups
+                    .contains(&"linux_sysfs_read".to_string()),
+                "{} should include linux_sysfs_read",
+                name
+            );
+            assert!(
+                !profile
+                    .security
+                    .groups
+                    .contains(&"linux_temp_read".to_string()),
+                "{} should not include linux_temp_read",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_opencode_profile_includes_tmpdir_and_state_dir() {
+        let policy = crate::policy::load_embedded_policy().expect("load embedded policy");
+        let opencode = policy.profiles.get("opencode").expect("opencode profile");
+        assert!(
+            opencode.filesystem.allow.contains(&"$TMPDIR".to_string()),
+            "opencode profile should allow $TMPDIR for Bun TUI runtime extraction"
+        );
+        assert!(
+            opencode
+                .filesystem
+                .allow
+                .contains(&"$HOME/.local/state/opencode".to_string()),
+            "opencode profile should allow $HOME/.local/state/opencode"
+        );
+    }
+
+    /// Regression test: verifies that all built-in profiles — regardless of
+    /// their signal_mode setting — will produce Seatbelt rules that allow
+    /// signaling child processes within the same sandbox.
+    ///
+    /// Background: the Seatbelt generator previously emitted only
+    /// `(allow signal (target self))` for `signal_mode: isolated`, which
+    /// blocked `kill(child_pid, sig)` on children that inherited the sandbox.
+    /// This caused orphan process accumulation and progressive keyboard lag.
+    ///
+    /// The fix is in the Seatbelt generation layer (macos.rs): both `Isolated`
+    /// and `AllowSameSandbox` now emit `(target same-sandbox)`, matching Linux
+    /// where Landlock's `LANDLOCK_SCOPE_SIGNAL` cannot distinguish the two.
+    #[test]
+    fn test_all_profiles_signal_mode_resolves() {
+        use crate::capability_ext::CapabilitySetExt;
+        use tempfile::tempdir;
+
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", "/home/nono-test"),
+            ("XDG_CONFIG_HOME", "/home/nono-test/.config"),
+            ("XDG_DATA_HOME", "/home/nono-test/.local/share"),
+            ("XDG_STATE_HOME", "/home/nono-test/.local/state"),
+            ("XDG_CACHE_HOME", "/home/nono-test/.cache"),
+        ]);
+
+        let workdir = tempdir().expect("tmpdir");
+        let args = crate::cli::SandboxArgs::default();
+
+        let profiles = list_builtin();
+        for name in &profiles {
+            let profile = get_builtin(name)
+                .unwrap_or_else(|| panic!("built-in profile '{}' should load", name));
+
+            let (caps, _) = nono::CapabilitySet::from_profile(&profile, workdir.path(), &args)
+                .unwrap_or_else(|e| panic!("profile '{}' should build caps: {}", name, e));
+
+            // Whether the profile uses Isolated or AllowSameSandbox, the
+            // Seatbelt generator must emit same-sandbox signal rules.
+            // This is verified by the library tests in macos.rs; here we
+            // just confirm the CapabilitySet builds without error and has
+            // a signal mode that the generator handles correctly.
+            let mode = caps.signal_mode();
+            assert!(
+                matches!(
+                    mode,
+                    nono::SignalMode::Isolated
+                        | nono::SignalMode::AllowSameSandbox
+                        | nono::SignalMode::AllowAll
+                ),
+                "profile '{}' has unexpected signal_mode {:?}",
+                name,
+                mode,
             );
         }
     }

@@ -5,6 +5,43 @@
 
 set -euo pipefail
 
+latest_tag() {
+    git describe --tags --abbrev=0 2>/dev/null || true
+}
+
+show_bump_rationale() {
+    local previous_tag="$1"
+    local range=""
+
+    if [[ -n "${previous_tag}" ]]; then
+        range="${previous_tag}..HEAD"
+        echo "Commits since ${previous_tag}:"
+    else
+        range="HEAD"
+        echo "Commits considered for initial release:"
+    fi
+
+    local conventional_commits
+    conventional_commits=$(git log --format='%s' "${range}" | grep -E '^[[:alpha:]]+(\([^)]*\))?!?: ' || true)
+
+    if [[ -z "${conventional_commits}" ]]; then
+        echo "  No conventional commits found in range; git-cliff selected the bump."
+        return
+    fi
+
+    printf '%s\n' "${conventional_commits}" | sed 's/^/  - /'
+
+    if printf '%s\n' "${conventional_commits}" | grep -Eq '^[[:alpha:]]+(\([^)]*\))?!: |BREAKING CHANGE'; then
+        echo "Bump rationale: breaking change detected, so bumping major."
+    elif printf '%s\n' "${conventional_commits}" | grep -Eq '^feat(\([^)]*\))?: '; then
+        echo "Bump rationale: at least one feat commit detected, so bumping minor."
+    elif printf '%s\n' "${conventional_commits}" | grep -Eq '^fix(\([^)]*\))?: '; then
+        echo "Bump rationale: only fix-level changes detected, so bumping patch."
+    else
+        echo "Bump rationale: no feat or breaking commits detected; git-cliff selected the bump."
+    fi
+}
+
 # Check if git-cliff is installed
 if ! command -v git-cliff &> /dev/null; then
     echo "Error: git-cliff is not installed"
@@ -14,6 +51,7 @@ fi
 
 # Get current version from workspace root Cargo.toml (nono crate)
 CURRENT_VERSION=$(grep '^version = ' crates/nono/Cargo.toml | head -1 | cut -d'"' -f2)
+PREVIOUS_TAG=$(latest_tag)
 echo "Current version: ${CURRENT_VERSION}"
 
 # Determine next version: use argument if provided, otherwise auto-detect
@@ -25,6 +63,10 @@ else
     NEXT_VERSION=${NEXT_VERSION_WITH_V#v}
 fi
 echo "Next version: ${NEXT_VERSION}"
+
+if [[ -z "${1:-}" ]]; then
+    show_bump_rationale "${PREVIOUS_TAG}"
+fi
 
 # Ask for confirmation
 read -p "Bump version to ${NEXT_VERSION}? (y/n) " -n 1 -r

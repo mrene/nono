@@ -181,3 +181,144 @@ fn test_groups_json() {
     let arr = val.as_array().expect("array");
     assert!(arr.len() > 10, "expected many groups in JSON output");
 }
+
+// ---------------------------------------------------------------------------
+// nono policy show --format manifest
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_show_format_manifest_default_profile() {
+    let output = nono_bin()
+        .args(["policy", "show", "default", "--format", "manifest"])
+        .output()
+        .expect("failed to run nono");
+
+    assert!(
+        output.status.success(),
+        "expected exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let val: serde_json::Value =
+        serde_json::from_str(&stdout).expect("expected valid JSON manifest");
+    assert_eq!(
+        val.get("version").and_then(|v| v.as_str()),
+        Some("0.1.0"),
+        "manifest must have version 0.1.0"
+    );
+    assert!(
+        val.get("$schema").is_some(),
+        "manifest should include $schema"
+    );
+}
+
+#[test]
+fn test_show_format_manifest_claude_code_profile() {
+    let output = nono_bin()
+        .args(["policy", "show", "claude-code", "--format", "manifest"])
+        .output()
+        .expect("failed to run nono");
+
+    assert!(
+        output.status.success(),
+        "expected exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let val: serde_json::Value =
+        serde_json::from_str(&stdout).expect("expected valid JSON manifest");
+    assert_eq!(val.get("version").and_then(|v| v.as_str()), Some("0.1.0"));
+    // claude-code profile has filesystem grants
+    assert!(
+        val.get("filesystem").is_some(),
+        "claude-code manifest should have filesystem grants"
+    );
+    let grants = val["filesystem"]["grants"]
+        .as_array()
+        .expect("grants array");
+    assert!(
+        !grants.is_empty(),
+        "claude-code should have at least one filesystem grant"
+    );
+}
+
+#[test]
+fn test_show_format_manifest_round_trip() {
+    // Build a minimal manifest with paths that exist everywhere,
+    // then feed it back via --config --dry-run.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = dir.path().join("manifest.json");
+    std::fs::write(
+        &manifest_path,
+        r#"{
+            "version": "0.1.0",
+            "filesystem": {
+                "grants": [{ "path": "/tmp", "access": "read" }]
+            },
+            "network": { "mode": "blocked" }
+        }"#,
+    )
+    .expect("write manifest");
+
+    let output = nono_bin()
+        .args([
+            "run",
+            "--config",
+            manifest_path.to_str().expect("path"),
+            "--dry-run",
+            "--",
+            "echo",
+            "hello",
+        ])
+        .output()
+        .expect("failed to run nono");
+
+    assert!(
+        output.status.success(),
+        "round-trip failed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_show_format_manifest_all_builtins_succeed() {
+    // All built-in profiles should export without errors
+    let list_output = nono_bin()
+        .args(["policy", "profiles", "--json"])
+        .output()
+        .expect("failed to run nono");
+    assert!(list_output.status.success());
+
+    let stdout = String::from_utf8_lossy(&list_output.stdout);
+    let profiles: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let arr = profiles.as_array().expect("array of profiles");
+
+    for profile_val in arr {
+        let name = profile_val
+            .get("name")
+            .and_then(|n| n.as_str())
+            .expect("profile name");
+
+        let output = nono_bin()
+            .args(["policy", "show", name, "--format", "manifest"])
+            .output()
+            .expect("failed to run nono");
+
+        assert!(
+            output.status.success(),
+            "profile '{}' failed manifest export, stderr: {}",
+            name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let val: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("profile '{}' produced invalid JSON: {}", name, e));
+        assert_eq!(
+            val.get("version").and_then(|v| v.as_str()),
+            Some("0.1.0"),
+            "profile '{}' manifest missing version",
+            name
+        );
+    }
+}

@@ -1,5 +1,739 @@
 # Changelog
 
+## [0.38.0] - 2026-04-20
+
+### Bug Fixes
+
+- *(trust)* Function or associated item not found in `TrustedRoot`
+
+- *(package)* Harden package installation security
+
+- *(hooks)* Invoke bash via env
+
+
+### Documentation
+
+- *(cli-package-publishing)* Add warning for unreleased feature
+
+- *(cli)* Add installation instructions for nix
+
+
+### Features
+
+- *(trust)* Prefer CI_CONFIG_REF_URI for GitLab workflow identity
+
+- *(claude-code)* Remove claude-code integration package
+
+- *(profile)* Add support for loading profiles from registry packs
+
+- *(profile)* Introduce packs and command_args for profiles
+
+- *(pack)* Introduce pack types and unify package naming
+
+- *(package)* Add install_dir artifact placement and hook unregistration
+
+- *(cli)* Add package management commands (pull, remove, search, list)
+
+- Implements environment variables filtering #688
+
+
+### Miscellaneous
+
+- Release v0.37.1
+
+
+### Refactoring
+
+- *(pkg)* Stream package artifact downloads
+
+- *(package)* Simplify artifact signer validation
+
+- *(package-cmd)* Centralize trust bundle for package verification
+
+- *(cli)* Improve artifact path validation
+
+
+### Style
+
+- Cargo fmt
+
+## [0.37.1] - 2026-04-17
+
+### Bug Fixes
+
+- *(macos)* Emit specific-op seatbelt rules for keychain DB allows
+
+- *(sandbox)* Allow Unix domain socket connections in restricted network modes
+
+- *(learn)* Print profile JSON as fallback when save fails
+
+
+### Documentation
+
+- Add github to credential route configuration
+
+
+### Miscellaneous
+
+- Upgrade rustls-webpki to 0.103.12 to fix RUSTSEC-2026-0098 and RUSTSEC-2026-0099
+
+- Upgrade rustls-webpki to 0.103.12 to fix RUSTSEC-2026-0098 and RUSTSEC-2026-0099
+
+
+### Style
+
+- Apply rustfmt
+
+## [0.37.0] - 2026-04-16
+
+### Bug Fixes
+
+- *(claude-code)* Enable token refresh via .claude.json symlink
+
+- *(profiles)* Prevent infinite recursion in profile extends check
+
+- *(sandbox)* Support claude-code profile extensions and simplify config
+
+
+### Features
+
+- *(claude-code)* Pre-create claude config lock directory
+
+
+### Refactoring
+
+- *(proxy-tls)* Remove rustls-pemfile and use pki_types for pem parsing
+
+## [0.36.0] - 2026-04-15
+
+### Bug Fixes
+
+- *(proxy)* Downgrade CONNECT-to-route-upstream log from warn to debug
+
+
+### Features
+
+- Add ?decode=go-keyring query param for keyring:// URIs
+
+- Add keyring:// URI scheme for custom-service credential lookup
+
+## [0.35.0] - 2026-04-14
+
+### Bug Fixes
+
+- Chore: lint
+
+- Chore: revert to json! obj syntax
+
+- Chore: split predicate out again for provider specific claims
+
+- Refactor: expose build config URI extension
+
+- *(pty)* Improve session gone error detection when connecting
+
+- *(cli)* Increase detached session startup timeout and order
+
+
+### Features
+
+- *(trust)* Support GitLab ID tokens for signing
+
+- Strip proxy artifacts and fix upstream connection handling
+
+
+### Miscellaneous
+
+- Revert doc string
+
+- Drop example workflow in comment
+
+- Mention GitLab tokens in doc comment
+
+
+### Refactoring
+
+- Use append to merge signer fields
+
+- Use build signer URI extension for trust
+
+## [0.34.0] - 2026-04-13
+
+### Bug Fixes
+
+- *(gpu)* Grant NVIDIA procfs paths required for CUDA init under --allow-gpu
+
+- *(gpu)* Add nvidia-uvm-tools to GPU device allowlist
+
+- *(proxy)* Add missing proxy field in regression tests
+
+- *(network-policy)* Activate anthropic credential in claude-code profile
+
+- *(proxy)* Set ANTHROPIC_API_KEY phantom token for anthropic credential
+
+- *(sandbox)* Use relative path for ~/.claude.json symlink
+
+- *(sandbox)* Redirect ~/.claude.json to ~/.claude/ via symlink on all unix platforms
+
+
+### Dependencies
+
+- *(deps)* Bump rustls from 0.23.37 to 0.23.38
+
+- *(deps)* Bump similar from 2.7.0 to 3.1.0
+
+- *(deps)* Bump rand from 0.10.0 to 0.10.1
+
+- *(deps)* Bump always-further/agent-sign from 0.0.8 to 0.0.11
+
+- *(deps)* Bump peter-evans/repository-dispatch from 3.0.0 to 4.0.1
+
+- *(deps)* Bump docker/build-push-action from 7.0.0 to 7.1.0
+
+- *(deps)* Bump softprops/action-gh-release from 2.6.1 to 3.0.0
+
+- *(deps)* Bump actions/upload-artifact from 7.0.0 to 7.0.1
+
+
+### Features
+
+- *(macos)* Auto-enable claude launch services, refine keychain access
+
+
+### Refactoring
+
+- *(policy)* Improve seatbelt path regex escaping
+
+
+### Testing
+
+- *(gpu)* Add unit + integration coverage for NVIDIA procfs grants
+
+- *(gpu)* Extract is_nvidia_compute_device predicate and add unit tests
+
+- *(proxy)* Add regression test for issue #624 phantom token bug
+
+
+### Style
+
+- Fix rustfmt formatting in sandbox_prepare.rs
+
+## [0.33.0] - 2026-04-12
+
+### Bug Fixes
+
+- Address review feedback on downstream bump workflows
+
+- *(fmt)* Sort imports alphabetically in command_runtime.rs
+
+- *(shell)* Initialize proxy runtime when credentials are configured
+
+- *(cli)* Decouple audit trail from rollback
+
+- *(proxy)* Guard macOS keychain hint with platform check
+
+- *(proxy)* Warn when keychain credential is not found
+
+- *(landlock)* Widen /proc/self Landlock rule to /proc for grandchild access
+
+- *(seccomp)* Resolve /proc/self correctly for grandchild processes
+
+- *(cli)* Adjust ps command output column widths
+
+- *(cli)* Align status and attach columns in ps output
+
+- *(test)* Add --allow-cwd to GPU integration tests
+
+- *(cli)* Compile dummy GPU function for non-macOS tests
+
+- *(pty-proxy)* Exit early if client socket cannot be set nonblocking
+
+- *(pty)* Correctly handle blocking state for attach streams
+
+- *(sandbox)* Prevent interactive CWD prompt in detached mode
+
+- Tighten GPU IOKit surface to AGXDeviceUserClient only
+
+- *(test)* Handle non-default TMPDIR in linux nested home grant test
+
+- *(policy)* Remove broad ~/.local allow from openclaw profile on Linux
+
+
+### CI/CD
+
+- Remove nono-registry from downstream dispatch
+
+- Add release automation for downstream SDK repos
+
+
+### Documentation
+
+- *(readme)* Add early alpha warning and remove separator
+
+- *(readme)* Overhaul content and visuals
+
+- *(cli)* Clarify --allow-gpu flag behavior and profile interaction
+
+
+### Features
+
+- *(macos)* Make parent-of-protected-root relaxation opt-in via profile
+
+- *(gpu)* Add WSL2 GPU support via /dev/dxg passthrough
+
+- *(gpu)* Add WSL2 GPU support via /dev/dxg passthrough
+
+- *(gpu)* Add Linux GPU access and improve macOS support
+
+- *(profile)* Introduce separate profile preparation for preflight
+
+- *(cli)* Introduce pre-flight CWD prompt for detached launches
+
+
+### Miscellaneous
+
+- Remove test results file
+
+
+### Performance
+
+- *(seccomp)* Skip read_tgid for direct child and use Cow for cap_check_path
+
+
+### Refactoring
+
+- *(cli-validation)* Propagate protected parent flag to cli validation
+
+- *(command-blocking)* Improve deprecation warning messages
+
+- *(command-blocking)* Deprecate startup-only command blocking
+
+
+### Testing
+
+- *(macos)* Address Gemini review feedback
+
+- *(macos)* Align GPU IOKit tests with tightened surface from #635
+
+- *(gpu)* Skip DRM tests if no render node permissions
+
+## [Unreleased]
+
+### Deprecations
+
+- Deprecate startup-only command blocking surfaces in `v0.33.0`, add compatibility warnings, and document the child-process bypass.
+
+## [0.32.0] - 2026-04-10
+
+### Features
+
+- Add upstream mTLS client certificate support
+
+## [0.31.0] - 2026-04-10
+
+### Bug Fixes
+
+- Tighten GPU IOKit rules
+
+- Remove allow_gpu from default profiles
+
+- Address review feedback for --allow-gpu
+
+- Add docs for --allow-gpu flag and improve test coverage
+
+- *(macos)* Deny keychain Mach IPC services on modern macOS
+
+- *(macos)* Allow atomic-write temp files for writable capabilities
+
+
+### Features
+
+- Add --allow-gpu flag for GPU access on Apple Silicon Macs
+
+- *(trust)* Add file:// backend for trust signing keys
+
+## [0.30.1] - 2026-04-09
+
+### Bug Fixes
+
+- *(cli)* Handle profile allow_file entries resolving to directories
+
+- *(cli)* Handle profile allow_file entries resolving to directories
+
+## [0.30.0] - 2026-04-08
+
+### Bug Fixes
+
+- *(macos)* Improve path resolution for non-existent files
+
+- *(reverse-proxy)* Authenticate requests on non-credentialed routes
+
+- *(test)* Guard EnvVarGuard::remove against unmanaged keys
+
+- *(test)* Prevent TMPDIR pollution by not auto-deleting temp dirs used as TMPDIR
+
+- *(test)* Add clippy disallowed_methods lint and migrate remaining unguarded env var tests
+
+- *(test)* Unify env var locks to eliminate flaky test failures
+
+- *(policy)* Avoid false deny for Nix store symlink targets on Linux
+
+- Allow filesystem.read entries to be files
+
+- *(proxy)* Address review feedback — normalize prefix in CredentialStore
+
+- *(proxy)* Handle route prefixes with leading slashes
+
+
+### Build
+
+- *(deps)* Bump getrandom from 0.4.1 to 0.4.2
+
+- *(deps)* Bump tokio from 1.49.0 to 1.51.0
+
+- *(deps)* Bump sha2 from 0.10.9 to 0.11.0
+
+- *(deps)* Bump docker/login-action from 4.0.0 to 4.1.0
+
+
+### Documentation
+
+- *(theme)* Update theme colors
+
+
+### Features
+
+- *(macos)* Expand keychain DB exception to include metadata DB
+
+- *(macos)* Allow future file grants and update policies
+
+- *(nix)* Improve NixOS compatibility for /nix/store paths
+
+- *(wsl2)* ABI-aware tests and rolling kernel documentation
+
+- *(trust)* Add `files` field for attesting arbitrary-location paths
+
+
+### Miscellaneous
+
+- *(scripts)* Add script to manage Claude authentication state
+
+
+### Performance
+
+- *(nono-proxy/route)* Cache upstream host:port for faster lookups
+
+
+### Refactoring
+
+- *(proxy)* Separate route configuration from credential configuration
+
+- *(policy)* Consolidate resolved deny target skipping logic
+
+## [0.29.1] - 2026-04-04
+
+### Bug Fixes
+
+- *(macos)* Allow DNS resolution via mDNSResponder in proxy and blocked modes (#588)
+
+- *(profile)* Add missing $TMPDIR and state dir to opencode profile
+
+- Ipv6 normalization logic
+
+- *(proxy)* Disable NO_PROXY bypass on macOS (#580)
+
+- *(policy)* Grant ~/.cache/claude readwrite in claude-code profile
+
+## [0.29.0] - 2026-04-03
+
+### Bug Fixes
+
+- *(proxy)* Don't factor seatbelt for port lockdown
+
+- *(pty_proxy)* Improve write retry test reliability with deadline-based polling
+
+- *(pty_proxy)* Remove timeout from test recv to prevent race condition
+
+- *(test)* Resolve race condition and cache key uniqueness
+
+
+### Build
+
+- *(deps)* Sort wait-timeout in Cargo.lock and fix credentials resolution
+
+
+### Documentation
+
+- *(cli)* Add `--detached` and `--name` flag documentation
+
+- Document supervised session lifecycle and runtime workflows
+
+
+### Features
+
+- *(cli)* Add manifest support and improve sandbox preparation
+
+- *(rollback)* Add configurable rollback destination support
+
+- *(pty,session,supervisor)* Enhance PTY attach/detach and socket utilities
+
+- *(pty_proxy)* Improve logging and error handling for attach/detach
+
+- *(exec_strategy)* Replace startup timeout thread with interactive prompt
+
+- *(diagnostic)* Add macOS sandbox violation logging and startup timeouts
+
+- *(rollback)* Condition audit state creation on rollback request flags
+
+- *(pty_proxy)* Disable keyboard enhancement modes on terminal restore
+
+- *(pty_proxy)* Improve enhanced key detection and multi-key sequences
+
+- *(pty_proxy)* Support enhanced CSI u key sequences in detach detection
+
+- *(runtime)* Harden supervised child dumpability and fd passing
+
+- *(runtime)* Land supervised sessions and diagnostics stack
+
+
+### Refactoring
+
+- *(output)* Consolidate leading break logic in print_terminal_block
+
+## [0.28.0] - 2026-04-03
+
+### Bug Fixes
+
+- *(proxy)* Add tls_ca field to file:// credential test fixtures
+
+- *(proxy)* Simplify tls_ca to tilde expansion and doc clarification
+
+- *(proxy)* Expand and validate tls_ca paths at credential resolution
+
+
+### Features
+
+- *(policy)* Expand git config paths in credentials group
+
+- *(credential,proxy)* Add missing tls_ca and tls_connector fields
+
+- *(proxy)* Add custom CA certificate support for upstream TLS (closes #545)
+
+- *(policy)* Skip system temp grants when HOME is nested under TMPDIR
+
+- *(policy)* Split homebrew group into platform-specific variants
+
+
+### Refactoring
+
+- *(proxy)* Wrap CA file read in Zeroizing and improve error messages
+
+- *(proxy)* Reuse policy::expand_path for tls_ca expansion
+
+- *(capability_ext)* Extract locked test helpers for env isolation
+
+- *(test)* Extract environment variable guard into reusable utility
+
+
+### Testing
+
+- *(cli)* Remove proptest regression file for manifest roundtrip
+
+- *(profile,query)* Isolate environment variables and fix symlink test
+
+
+### Style
+
+- Fix rustfmt in tls_ca path expansion closure
+
+## [0.27.0] - 2026-04-02
+
+### Bug Fixes
+
+- *(test)* Use real temp directories for env_nono_allow_comma_separated
+
+- *(proxy)* Strip port suffix from allow_domain entries in proxy host filter
+
+- Tighten manifest round-trip fidelity and wire proxy from --config
+
+- *(test)* Use portable paths in manifest round-trip test
+
+- Harden --config flag conflicts and error handling
+
+- *(macos)* Align Seatbelt signal isolation with Linux Landlock behaviour
+
+- Gate deny-overlap test to Linux only
+
+- Harden deny-overlap validation, reject unknown profile fields, narrow user_tools scope
+
+
+### Dependencies
+
+- *(deps)* Bump tracing-subscriber from 0.3.22 to 0.3.23
+
+- *(deps)* Bump ureq from 3.2.0 to 3.3.0
+
+
+### Documentation
+
+- Replace mention of --supervised with --capability-elevation in README
+
+- Address review feedback on wsl2 cross-references
+
+- Add WSL2 cross-references to feature docs and fix discoverability
+
+- Move endpoint filtering from credential injection to networking page
+
+- *(keystore)* Update module docs for file:// scheme and add redaction
+
+
+### Features
+
+- *(policy)* Check credentials Option with is_some_and instead of field access
+
+- *(proxy)* Block CONNECT to credential upstreams and smart NO_PROXY
+
+- *(sandbox)* Add allow_domain ports to Landlock ConnectTcp rules
+
+- *(profile)* Allow child to override inherited credentials to empty
+
+- *(schema)* Allow additionalProperties for forward-compatible evolution
+
+- *(cli)* Add `nono policy show --format manifest` for profile-to-manifest compilation
+
+- *(cli)* Wire up --config manifest path in prepare_sandbox
+
+- *(cli)* Add conflicts_with to --config flag
+
+- *(manifest)* Add typify codegen, manifest module, and CapabilitySet conversion
+
+- *(schema)* Add capability manifest JSON Schema
+
+- *(proxy)* Auto-detect credential format from inject_header
+
+- *(keystore)* Preserve significant whitespace in secret files
+
+- *(profile)* Accept file:// credential keys in custom_credentials
+
+- *(keystore)* Wire file:// into credential dispatch and CLI mappings
+
+- *(keystore)* Add load_from_file() for file:// credential source
+
+- *(keystore)* Add file:// URI validation for local file credentials
+
+- *(policy)* Split linux system groups for granular host compatibility
+
+- Add $XDG_RUNTIME_DIR to variable expansion
+
+
+### Refactoring
+
+- Deduplicate path expansion and fs grant construction
+
+- *(keystore)* Extract file-backed secret helpers
+
+
+### Testing
+
+- *(env_vars)* Use as_str() for contains() calls
+
+- *(env_vars)* Replace to_str() with display().to_string()
+
+- *(profile,trust_scan)* Add env lock guards to fix test isolation
+
+- *(cli)* Add global env lock for parallel test isolation
+
+- *(cli)* Add integration tests for --config manifest flag
+
+- *(profile)* Add endpoint_rules field to credential test fixtures
+
+
+### Revert
+
+- Keep ~/.local/state in user_tools, defer to #546
+
+## [0.26.1] - 2026-03-31
+
+### Bug Fixes
+
+- *(learn)* Make Enter actually skip profile save prompt (closes #431)
+
+- *(proxy)* Use lossy UTF-8 decoding for percent-encoded paths
+
+- *(proxy)* Percent-decode paths before endpoint rule matching
+
+
+### CI/CD
+
+- *(workflows)* Decouple image build from release workflow
+
+
+### Dependencies
+
+- *(deps)* Bump docker/setup-buildx-action from 3.12.0 to 4.0.0
+
+- *(deps)* Bump toml from 1.0.6+spec-1.1.0 to 1.0.7+spec-1.1.0
+
+- *(deps)* Bump docker/setup-qemu-action from 3.7.0 to 4.0.0
+
+- *(deps)* Bump docker/build-push-action from 6.19.2 to 7.0.0
+
+- *(deps)* Bump docker/login-action from 3.7.0 to 4.0.0
+
+- *(deps)* Bump sigstore/cosign-installer from 3.10.1 to 4.1.1
+
+
+### Miscellaneous
+
+- Add DCO sign-off requirement to CLAUDE.md
+
+## [0.26.0] - 2026-03-30
+
+### Bug Fixes
+
+- *(wsl2)* Security hardening from code review
+
+- *(learn)* Resolve fs_usage pipe buffering and process name mismatch on macOS
+
+
+### CI/CD
+
+- *(workflows)* Extract push condition to environment variable
+
+- *(workflows)* Extract Docker image build into reusable workflow
+
+- *(release)* Fix workflow inputs reference syntax
+
+- *(release)* Use inputs.tag fallback in Docker publish condition
+
+- *(release)* Support manual tag input in workflow conditions
+
+
+### Documentation
+
+- *(wsl2)* Add WSL2 documentation and feature matrix (Track 1.5)
+
+
+### Features
+
+- *(wsl2)* Add WSL2 feature matrix to setup --check-only (Track 1.4)
+
+- *(wsl2)* Clarify proxy network enforcement on WSL2 (Track 1.3)
+
+- *(wsl2)* Guard seccomp notify paths for WSL2 (Track 1.2)
+
+- *(wsl2)* Add WSL2 detection, feature matrix, and integration tests (Track 1.1)
+
+- *(proxy)* Add L7 method+path endpoint filtering for reverse proxy routes (#465)
+
+- *(ci)* Add Docker image build and push to release workflow (#511) ([#511](https://github.com/always-further/nono/pull/511))
+
+- *(cli)* Add --log-file flag to redirect logs to a file (#490) ([#490](https://github.com/always-further/nono/pull/490))
+
+
+### Miscellaneous
+
+- Add .gitattributes to enforce LF line endings
+
 ## [0.25.0] - 2026-03-26
 
 ### Features
@@ -488,4 +1222,3 @@
 ### 🚀 Features
 
 - First release of seperarate nono and nono-cli packages
-

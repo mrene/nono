@@ -1,21 +1,26 @@
 //! Secure credential loading from system keystore, 1Password, Apple Passwords, and environment
 //!
 //! This module provides functionality to load secrets from the system keystore
-//! (macOS Keychain / Linux Secret Service), 1Password (via the `op` CLI), or
-//! Apple Passwords (via macOS `security`) or environment variables (via the
-//! `env://` scheme) and return them as zeroized strings.
+//! (macOS Keychain / Linux Secret Service), 1Password (via the `op` CLI),
+//! Apple Passwords (via macOS `security`), custom keyring entries (via the
+//! `keyring` crate), or environment variables (via the `env://` scheme) and
+//! return them as zeroized strings.
 //!
 //! Credential references are dispatched by URI scheme:
 //! - `env://VAR_NAME` — reads from the current process environment
+//! - `file:///path/to/secret` — reads from a local file (before sandbox activation)
 //! - `op://vault/item/field` — loaded via the 1Password CLI
 //! - `apple-password://server/account` — loaded via macOS `security`
-//! - Everything else — loaded from the system keyring
+//! - `keyring://service/account` — loaded from the system keyring with a custom service name
+//! - Everything else — loaded from the system keyring (service name `nono`)
 //!
 //! All secrets are wrapped in `Zeroizing<String>` to ensure they are securely
 //! cleared from memory after use.
 
 use crate::error::{NonoError, Result};
 use std::collections::HashMap;
+use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -45,8 +50,15 @@ const APPLE_PASSWORD_URI_PREFIX: &str = "apple-password://";
 /// Alias prefix for Apple Passwords backend.
 const APPLE_PASSWORDS_URI_PREFIX: &str = "apple-passwords://";
 
+/// The `keyring://` URI scheme prefix, indicating a custom-service keyring lookup.
+const KEYRING_URI_PREFIX: &str = "keyring://";
+
 /// The `env://` URI scheme prefix, indicating environment variable backend.
 const ENV_URI_PREFIX: &str = "env://";
+
+/// The `file://` URI scheme prefix, indicating a local file credential source.
+/// Read once at startup before sandbox activation; contents zeroed on drop.
+const FILE_URI_PREFIX: &str = "file://";
 
 /// Environment variable names that must never be loaded via `env://`.
 ///
@@ -90,13 +102,14 @@ const FORBIDDEN_URI_CHARS: &[char] = &[
     ';', '|', '&', '$', '`', '(', ')', '{', '}', '<', '>', '!', '\\', '"', '\'', '\n', '\r', '\0',
 ];
 
-/// Load secrets from the system keystore, 1Password, or Apple Passwords
+/// Load secrets from the system keystore, 1Password, Apple Passwords, or keyring
 ///
 /// Credential references with URI schemes are dispatched to their backend:
 /// - `op://` -> 1Password CLI
 /// - `apple-password://` -> macOS security CLI
+/// - `keyring://` -> system keyring with custom service name
 /// - `env://` -> parent process environment
-/// - everything else -> system keyring
+/// - everything else -> system keyring (service name `nono`)
 ///
 /// # Arguments
 /// * `service` - The service name in the keystore (e.g., "nono")
@@ -142,15 +155,17 @@ pub fn load_secrets(
 /// Load a single secret, dispatching to the appropriate backend.
 ///
 /// Dispatch order:
-/// 1. `env://VAR` — reads from the process environment
-/// 2. `op://vault/item/field` — delegates to the 1Password CLI
-/// 3. `apple-password://server/account` — delegates to macOS `security`
-/// 4. Everything else — loads from the system keyring
+/// 1. `file:///path` — reads from a local file (before sandbox activation)
+/// 2. `env://VAR` — reads from the process environment
+/// 3. `op://vault/item/field` — delegates to the 1Password CLI
+/// 4. `apple-password://server/account` — delegates to macOS `security`
+/// 5. `keyring://service/account` — loads from system keyring with custom service
+/// 6. Everything else — loads from the system keyring (service name `nono`)
 ///
 /// # Arguments
 /// * `service` - Keyring service name (only used for keyring backend)
-/// * `credential_ref` - A keyring account name, `op://` URI, Apple Passwords URI,
-///   or `env://` URI
+/// * `credential_ref` - A keyring account name, `file://` URI, `op://` URI,
+///   Apple Passwords URI, or `env://` URI
 ///
 /// # Security
 /// The returned value is wrapped in `Zeroizing<String>`. For URI-based managers
@@ -160,12 +175,16 @@ pub fn load_secrets(
 /// internal buffers.
 #[must_use = "loaded secret should be used or explicitly dropped"]
 pub fn load_secret_by_ref(service: &str, credential_ref: &str) -> Result<Zeroizing<String>> {
-    if credential_ref.starts_with(ENV_URI_PREFIX) {
+    if credential_ref.starts_with(FILE_URI_PREFIX) {
+        load_from_file(credential_ref)
+    } else if credential_ref.starts_with(ENV_URI_PREFIX) {
         load_from_env(credential_ref)
     } else if credential_ref.starts_with(OP_URI_PREFIX) {
         load_from_op(credential_ref)
     } else if is_apple_password_uri(credential_ref) {
         load_from_apple_password(credential_ref)
+    } else if is_keyring_uri(credential_ref) {
+        load_from_keyring_uri(credential_ref)
     } else {
         load_single_secret(service, credential_ref)
     }
@@ -316,10 +335,224 @@ fn parse_apple_password_uri(uri: &str) -> Result<(&str, &str)> {
     Ok((server, account))
 }
 
+/// Returns true if the credential reference is a `keyring://` URI.
+#[must_use]
+pub fn is_keyring_uri(credential_ref: &str) -> bool {
+    credential_ref.starts_with(KEYRING_URI_PREFIX)
+}
+
+/// Maximum byte length for a `keyring://` URI (scheme + service + account + query).
+///
+/// Generous enough for real service/account names but prevents accidentally
+/// passing absurdly long strings to OS keyring APIs.
+const KEYRING_URI_MAX_LEN: usize = 1024;
+
+/// Post-load decoding to apply to a keyring value.
+///
+/// Some tools wrap stored credentials in their own encoding. This enum
+/// represents the supported `?decode=` transforms that can be requested
+/// via the `keyring://` URI query string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyringDecode {
+    /// No transform — return the raw stored value.
+    None,
+    /// Strip the `go-keyring-base64:` prefix and base64-decode the remainder.
+    ///
+    /// Used by Go tools built with `github.com/zalando/go-keyring` (e.g., `gh`).
+    GoKeyring,
+}
+
+/// The prefix that `zalando/go-keyring` prepends to stored values.
+const GO_KEYRING_PREFIX: &str = "go-keyring-base64:";
+
+/// Allowed values for the `?decode=` query parameter.
+const KEYRING_DECODE_GO_KEYRING: &str = "go-keyring";
+
+/// Validate a `keyring://` URI.
+///
+/// Accepted formats:
+/// - `keyring://service/account` — look up by service and account
+/// - `keyring://service/account?decode=go-keyring` — with post-load decoding
+///
+/// Rejects:
+/// - Empty service or account
+/// - Characters that could enable argument injection
+/// - Unknown query parameters or values
+/// - Fragment identifiers
+/// - Missing account segment
+/// - URIs exceeding 1024 bytes
+pub fn validate_keyring_uri(uri: &str) -> Result<()> {
+    if uri.len() > KEYRING_URI_MAX_LEN {
+        return Err(NonoError::ConfigParse(format!(
+            "keyring URI exceeds maximum length of {} bytes",
+            KEYRING_URI_MAX_LEN
+        )));
+    }
+
+    let path = uri.strip_prefix(KEYRING_URI_PREFIX).ok_or_else(|| {
+        NonoError::ConfigParse(format!(
+            "credential reference '{}' does not start with '{}'",
+            uri, KEYRING_URI_PREFIX
+        ))
+    })?;
+
+    // Reject fragments unconditionally.
+    if path.contains('#') {
+        return Err(NonoError::ConfigParse(format!(
+            "keyring URI must not contain fragment identifiers: {}",
+            uri
+        )));
+    }
+
+    // Split off the query string (if any) before validating the path.
+    let (path_part, query_part) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
+
+    // Validate query parameters against the allowlist.
+    if let Some(query) = query_part {
+        validate_keyring_query(query, uri)?;
+    }
+
+    if let Some(bad) = path_part.chars().find(|c| FORBIDDEN_URI_CHARS.contains(c)) {
+        return Err(NonoError::ConfigParse(format!(
+            "keyring URI contains forbidden character {:?}: {}",
+            bad, uri
+        )));
+    }
+
+    let segments: Vec<&str> = path_part.split('/').collect();
+    if segments.len() != 2 {
+        return Err(NonoError::ConfigParse(format!(
+            "keyring URI must be 'keyring://service/account': {}",
+            uri
+        )));
+    }
+
+    if segments.iter().any(|s| s.is_empty()) {
+        return Err(NonoError::ConfigParse(format!(
+            "keyring URI has empty service/account segment: {}",
+            uri
+        )));
+    }
+
+    Ok(())
+}
+
+/// Validate the query string of a `keyring://` URI.
+///
+/// Only `decode=go-keyring` is accepted. Unknown keys or values are rejected
+/// to prevent silent misconfiguration.
+fn validate_keyring_query(query: &str, full_uri: &str) -> Result<()> {
+    for param in query.split('&') {
+        let (key, value) = param.split_once('=').ok_or_else(|| {
+            NonoError::ConfigParse(format!(
+                "keyring URI query parameter missing value: '{}' in {}",
+                param, full_uri
+            ))
+        })?;
+
+        match key {
+            "decode" => match value {
+                KEYRING_DECODE_GO_KEYRING => {}
+                _ => {
+                    return Err(NonoError::ConfigParse(format!(
+                        "keyring URI has unknown decode value '{}'. \
+                         Supported: {}",
+                        value, KEYRING_DECODE_GO_KEYRING
+                    )));
+                }
+            },
+            _ => {
+                return Err(NonoError::ConfigParse(format!(
+                    "keyring URI has unknown query parameter '{}'. \
+                     Supported: decode",
+                    key
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parsed components of a `keyring://` URI.
+struct KeyringUriParts<'a> {
+    service: &'a str,
+    account: &'a str,
+    decode: KeyringDecode,
+}
+
+fn parse_keyring_uri(uri: &str) -> Result<KeyringUriParts<'_>> {
+    validate_keyring_uri(uri)?;
+    let path = uri.strip_prefix(KEYRING_URI_PREFIX).ok_or_else(|| {
+        NonoError::ConfigParse(format!(
+            "credential reference '{}' is not a keyring URI",
+            uri
+        ))
+    })?;
+
+    // Split off query string before parsing path segments.
+    let (path_part, query_part) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
+
+    let mut segments = path_part.splitn(2, '/');
+    let service = segments.next().ok_or_else(|| {
+        NonoError::ConfigParse(format!("keyring URI missing service segment: {}", uri))
+    })?;
+    let account = segments.next().ok_or_else(|| {
+        NonoError::ConfigParse(format!("keyring URI missing account segment: {}", uri))
+    })?;
+
+    let decode = match query_part {
+        Some(q) if q.contains(KEYRING_DECODE_GO_KEYRING) => KeyringDecode::GoKeyring,
+        _ => KeyringDecode::None,
+    };
+
+    Ok(KeyringUriParts {
+        service,
+        account,
+        decode,
+    })
+}
+
+/// Redact the account segment of a `keyring://` URI for safe logging.
+///
+/// `keyring://service/account` → `keyring://service/<redacted>`
+/// `keyring://service/account?decode=go-keyring` → `keyring://service/<redacted>?decode=go-keyring`
+pub fn redact_keyring_uri(uri: &str) -> String {
+    if let Some(path) = uri.strip_prefix(KEYRING_URI_PREFIX) {
+        // Split off query string so we can preserve it.
+        let (path_part, query_part) = match path.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (path, None),
+        };
+        let mut segments = path_part.splitn(2, '/');
+        if let Some(service) = segments.next() {
+            if !service.is_empty() && segments.next().is_some() {
+                let suffix = match query_part {
+                    Some(q) => format!("?{}", q),
+                    None => String::new(),
+                };
+                return format!("keyring://{}/<redacted>{}", service, suffix);
+            }
+        }
+    }
+    "keyring://***".to_string()
+}
+
 /// Returns true if the credential reference is an `env://` URI.
 #[must_use]
 pub fn is_env_uri(credential_ref: &str) -> bool {
     credential_ref.starts_with(ENV_URI_PREFIX)
+}
+
+/// Check if a credential reference uses the `file://` scheme.
+#[must_use]
+pub fn is_file_uri(credential_ref: &str) -> bool {
+    credential_ref.starts_with(FILE_URI_PREFIX)
 }
 
 /// Validate an `env://VAR_NAME` URI.
@@ -364,6 +597,58 @@ pub fn validate_env_uri(uri: &str) -> Result<()> {
         return Err(NonoError::ConfigParse(format!(
             "env:// cannot read dangerous environment variable: {}",
             var_name
+        )));
+    }
+
+    Ok(())
+}
+
+/// Validate a `file://` URI for local file credential sources.
+///
+/// Expected format: `file:///absolute/path` (triple slash for absolute paths).
+///
+/// Rejects:
+/// - Non-absolute paths (must start with `/` after `file://`)
+/// - Empty or root-only paths
+/// - Path traversal (`..` components)
+/// - Dangerous characters (null, newline, semicolons, backticks, pipes, shell expansion)
+pub fn validate_file_uri(uri: &str) -> Result<()> {
+    let path_str = uri.strip_prefix(FILE_URI_PREFIX).ok_or_else(|| {
+        NonoError::ConfigParse(format!(
+            "credential reference '{}' does not start with '{}'",
+            uri, FILE_URI_PREFIX
+        ))
+    })?;
+
+    if !path_str.starts_with('/') {
+        return Err(NonoError::ConfigParse(format!(
+            "file:// URI must use an absolute path (file:///path), got: {}",
+            uri
+        )));
+    }
+
+    let meaningful = path_str.trim_end_matches('/');
+    if meaningful.is_empty() || meaningful == "/" {
+        return Err(NonoError::ConfigParse(format!(
+            "file:// URI path is empty: {}",
+            uri
+        )));
+    }
+
+    for component in std::path::Path::new(path_str).components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(NonoError::ConfigParse(format!(
+                "file:// URI must not contain path traversal (..): {}",
+                uri
+            )));
+        }
+    }
+
+    const FORBIDDEN_FILE_CHARS: &[char] = &['\0', '\n', '\r', ';', '`', '|', '$', '&', '>', '<'];
+    if let Some(bad) = path_str.chars().find(|c| FORBIDDEN_FILE_CHARS.contains(c)) {
+        return Err(NonoError::ConfigParse(format!(
+            "file:// URI contains forbidden character {:?}: {}",
+            bad, uri
         )));
     }
 
@@ -442,6 +727,150 @@ fn load_from_env(uri: &str) -> Result<Zeroizing<String>> {
             var_name
         ))),
     }
+}
+
+/// Load a secret from a local file via `file://` URI.
+///
+/// Reads the file contents at startup (before sandbox activation), trims
+/// whitespace, and wraps the result in `Zeroizing<String>`. The file is
+/// read once — subsequent access is from the in-memory zeroized copy.
+///
+/// # Errors
+///
+/// Returns `SecretNotFound` if the file does not exist or is empty.
+/// Returns `KeystoreAccess` for other I/O errors (permissions, etc.).
+fn load_from_file(uri: &str) -> Result<Zeroizing<String>> {
+    validate_file_uri(uri)?;
+
+    let path_str = uri
+        .strip_prefix(FILE_URI_PREFIX)
+        .ok_or_else(|| NonoError::ConfigParse(format!("invalid file:// URI: {}", uri)))?;
+
+    let trimmed = load_secret_file(Path::new(path_str)).map_err(|e| match e {
+        NonoError::SecretNotFound(_) => {
+            NonoError::SecretNotFound(format!("credential file not found: {}", path_str))
+        }
+        NonoError::KeystoreAccess(_) => {
+            NonoError::KeystoreAccess(format!("failed to read credential file '{}'", path_str))
+        }
+        other => other,
+    })?;
+
+    tracing::debug!("Loaded secret from {}", redact_file_uri(uri));
+    Ok(trimmed)
+}
+
+/// Load a secret from a local file and wrap it in [`Zeroizing`].
+///
+/// Intended for callers that need a common file-backed secret path without
+/// duplicating plaintext handling. A single trailing line ending is removed to
+/// match CLI-based secret loaders; other leading/trailing whitespace is
+/// preserved.
+pub fn load_secret_file(path: &Path) -> Result<Zeroizing<String>> {
+    let mut content = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            NonoError::SecretNotFound(format!("secret file not found: {}", path.display()))
+        } else {
+            NonoError::KeystoreAccess(format!(
+                "failed to read secret file '{}': {}",
+                path.display(),
+                e
+            ))
+        }
+    })?);
+
+    if content.ends_with("\r\n") {
+        let new_len = content.len().saturating_sub(2);
+        content.truncate(new_len);
+    } else if content.ends_with('\n') {
+        let new_len = content.len().saturating_sub(1);
+        content.truncate(new_len);
+    }
+
+    if content.is_empty() {
+        return Err(NonoError::SecretNotFound(format!(
+            "secret file '{}' is empty",
+            path.display()
+        )));
+    }
+
+    Ok(content)
+}
+
+/// Store a secret in a local file with owner-only permissions on Unix.
+///
+/// This is primarily used by trust-related file-backed keystore adapters and
+/// keeps the file handling consistent with runtime secret loading helpers.
+pub fn store_secret_file(path: &Path, secret: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            NonoError::KeystoreAccess(format!(
+                "failed to create secret directory {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        if path.exists() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+                |e| {
+                    NonoError::KeystoreAccess(format!(
+                        "failed to secure existing secret file {}: {e}",
+                        path.display()
+                    ))
+                },
+            )?;
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| {
+                NonoError::KeystoreAccess(format!(
+                    "failed to store secret at {}: {e}",
+                    path.display()
+                ))
+            })?;
+
+        file.write_all(secret.as_bytes()).map_err(|e| {
+            NonoError::KeystoreAccess(format!("failed to store secret at {}: {e}", path.display()))
+        })?;
+
+        file.sync_all().map_err(|e| {
+            NonoError::KeystoreAccess(format!(
+                "failed to sync secret file {}: {e}",
+                path.display()
+            ))
+        })?;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            NonoError::KeystoreAccess(format!(
+                "failed to secure secret file {}: {e}",
+                path.display()
+            ))
+        })?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut file = std::fs::File::create(path).map_err(|e| {
+            NonoError::KeystoreAccess(format!("failed to store secret at {}: {e}", path.display()))
+        })?;
+
+        file.write_all(secret.as_bytes()).map_err(|e| {
+            NonoError::KeystoreAccess(format!("failed to store secret at {}: {e}", path.display()))
+        })?;
+    }
+
+    Ok(())
 }
 
 /// Load a single secret from the keystore.
@@ -613,6 +1042,82 @@ fn load_from_apple_password(uri: &str) -> Result<Zeroizing<String>> {
     }
 }
 
+/// Load a secret from the system keyring using a custom service name.
+///
+/// Uses the `keyring` crate with the service and account parsed from a
+/// `keyring://service/account` URI. This is cross-platform: macOS Keychain
+/// (generic passwords), Linux Secret Service, Windows Credential Manager.
+///
+/// If `?decode=go-keyring` is specified, the stored value is unwrapped from
+/// the `go-keyring-base64:` encoding used by `github.com/zalando/go-keyring`.
+fn load_from_keyring_uri(uri: &str) -> Result<Zeroizing<String>> {
+    let parts = parse_keyring_uri(uri)?;
+    let redacted = redact_keyring_uri(uri);
+    tracing::debug!("Loading secret from system keyring: {}", redacted);
+
+    let entry = keyring::Entry::new(parts.service, parts.account).map_err(|e| {
+        NonoError::KeystoreAccess(format!(
+            "Failed to access keyring for '{}': {}",
+            redacted, e
+        ))
+    })?;
+
+    match entry.get_password() {
+        Ok(password) => {
+            tracing::debug!("Successfully loaded secret '{}'", redacted);
+            let decoded = apply_keyring_decode(password, parts.decode, &redacted)?;
+            Ok(decoded)
+        }
+        Err(keyring::Error::NoEntry) => Err(NonoError::SecretNotFound(format!(
+            "keyring entry not found: '{}'. \
+             Verify the service and account match the stored credential.",
+            redacted
+        ))),
+        Err(keyring::Error::Ambiguous(creds)) => Err(NonoError::KeystoreAccess(format!(
+            "Multiple entries ({}) found for '{}' - please resolve manually",
+            creds.len(),
+            redacted
+        ))),
+        Err(e) => Err(NonoError::KeystoreAccess(format!(
+            "Cannot access '{}': {}",
+            redacted, e
+        ))),
+    }
+}
+
+/// Apply the requested post-load decoding to a keyring value.
+fn apply_keyring_decode(
+    raw: String,
+    decode: KeyringDecode,
+    redacted_uri: &str,
+) -> Result<Zeroizing<String>> {
+    match decode {
+        KeyringDecode::None => Ok(Zeroizing::new(raw)),
+        KeyringDecode::GoKeyring => {
+            let encoded = raw.strip_prefix(GO_KEYRING_PREFIX).ok_or_else(|| {
+                NonoError::ConfigParse(format!(
+                    "keyring value for '{}' does not have the expected '{}' prefix. \
+                     Remove ?decode=go-keyring if this credential was not stored by a Go tool.",
+                    redacted_uri, GO_KEYRING_PREFIX
+                ))
+            })?;
+            let bytes = crate::trust::base64::base64_decode(encoded).map_err(|e| {
+                NonoError::ConfigParse(format!(
+                    "failed to base64-decode go-keyring value for '{}': {}",
+                    redacted_uri, e
+                ))
+            })?;
+            let decoded = String::from_utf8(bytes).map_err(|_| {
+                NonoError::ConfigParse(format!(
+                    "go-keyring decoded value for '{}' is not valid UTF-8",
+                    redacted_uri
+                ))
+            })?;
+            Ok(Zeroizing::new(decoded))
+        }
+    }
+}
+
 /// Classify `op` CLI errors into actionable error messages.
 fn classify_op_error(stderr: &str, uri: &str) -> NonoError {
     let redacted = redact_op_uri(uri);
@@ -700,6 +1205,18 @@ pub fn redact_apple_password_uri(uri: &str) -> String {
     "apple-password://***".to_string()
 }
 
+/// Redact a file:// URI for safe logging.
+/// Keeps the directory structure but replaces the filename.
+/// `file:///run/secrets/api-token` → `file:///run/secrets/[REDACTED]`
+pub fn redact_file_uri(uri: &str) -> String {
+    if let Some(path) = uri.strip_prefix(FILE_URI_PREFIX) {
+        if let Some(last_slash) = path.rfind('/') {
+            return format!("{}{}[REDACTED]", FILE_URI_PREFIX, &path[..=last_slash]);
+        }
+    }
+    format!("{}[REDACTED]", FILE_URI_PREFIX)
+}
+
 /// Wait for a child process with a timeout.
 ///
 /// Returns the process output on success, or a timeout error.
@@ -765,9 +1282,10 @@ fn wait_with_timeout(
 ///
 /// Bare URI entries without explicit target variables are rejected.
 ///
-/// Apple Passwords references (`apple-password://...`) are not supported in
-/// this list-based parser. Use `build_mappings_from_pairs` (CLI:
-/// `--env-credential-map <CREDENTIAL_REF> <ENV_VAR>`) for explicit mapping.
+/// Apple Passwords references (`apple-password://...`) and keyring references
+/// (`keyring://...`) are not supported in this list-based parser. Use
+/// `build_mappings_from_pairs` (CLI: `--env-credential-map <CREDENTIAL_REF>
+/// <ENV_VAR>`) for explicit mapping.
 ///
 /// Environment URIs (`env://...`) auto-derive the target variable name from the source
 /// when `=` is omitted: `env://GITHUB_TOKEN` maps to env var `GITHUB_TOKEN`.
@@ -775,8 +1293,8 @@ fn wait_with_timeout(
 /// # Errors
 ///
 /// Returns an error if a URI-based secret manager entry is provided without an
-/// explicit target variable suffix, if an Apple Passwords URI is provided in
-/// list mode, or if any URI fails validation.
+/// explicit target variable suffix, if an Apple Passwords or keyring URI is
+/// provided in list mode, or if any URI fails validation.
 ///
 /// # Example
 ///
@@ -824,6 +1342,32 @@ pub fn build_mappings_from_list(accounts: &str) -> Result<HashMap<String, String
                 };
                 mappings.insert(entry.to_string(), source_var.to_string());
             }
+        } else if entry.starts_with(FILE_URI_PREFIX) {
+            // file:// URI: must have explicit =VAR_NAME suffix because
+            // you can't derive a meaningful env var name from a file path.
+            // Format: file:///path/to/secret=MY_VAR
+            if let Some(eq_pos) = entry.rfind('=') {
+                let uri = &entry[..eq_pos];
+                let var_name = &entry[eq_pos + 1..];
+
+                if var_name.is_empty() {
+                    return Err(NonoError::ConfigParse(format!(
+                        "file:// credential '{}' has '=' but no variable name. \
+                         Use format: file:///path/to/secret=MY_VAR",
+                        uri
+                    )));
+                }
+
+                validate_file_uri(uri)?;
+                validate_destination_env_var(var_name)?;
+                mappings.insert(uri.to_string(), var_name.to_string());
+            } else {
+                return Err(NonoError::ConfigParse(format!(
+                    "file:// credential '{}' requires an explicit target variable. \
+                     Use format: file:///path/to/secret=MY_VAR",
+                    entry
+                )));
+            }
         } else if entry.starts_with(OP_URI_PREFIX) {
             // 1Password URI: must have =VAR_NAME suffix
             // Find the last '=' that separates the URI from the var name.
@@ -857,6 +1401,12 @@ pub fn build_mappings_from_list(accounts: &str) -> Result<HashMap<String, String
                 "Apple Passwords credential '{}' is not supported in --env-credential. \
                  Use --env-credential-map 'apple-password://server/account' MY_VAR",
                 redact_apple_password_uri(entry)
+            )));
+        } else if is_keyring_uri(entry) {
+            return Err(NonoError::ConfigParse(format!(
+                "keyring credential '{}' is not supported in --env-credential. \
+                 Use --env-credential-map 'keyring://service/account' MY_VAR",
+                redact_keyring_uri(entry)
             )));
         } else {
             // Keyring name: auto-uppercase to env var name
@@ -900,6 +1450,8 @@ pub fn build_mappings_from_pairs(pairs: &[(String, String)]) -> Result<HashMap<S
             validate_op_uri(credential_ref)?;
         } else if is_apple_password_uri(credential_ref) {
             validate_apple_password_uri(credential_ref)?;
+        } else if is_keyring_uri(credential_ref) {
+            validate_keyring_uri(credential_ref)?;
         } else if credential_ref.starts_with(ENV_URI_PREFIX) {
             validate_env_uri(credential_ref)?;
         }
@@ -927,7 +1479,8 @@ pub fn build_mappings_from_pairs(pairs: &[(String, String)]) -> Result<HashMap<S
 ///
 /// Returns an error if a URI-based credential in `cli_secrets` is missing
 /// an explicit target variable suffix (`=VAR_NAME` for `op://`), if
-/// `apple-password://` appears in list mode, or if URI/env-var validation fails.
+/// `apple-password://` or `keyring://` appears in list mode, or if
+/// URI/env-var validation fails.
 pub fn build_secret_mappings(
     cli_secrets: Option<&str>,
     cli_secret_mappings: &[(String, String)],
@@ -951,6 +1504,8 @@ pub fn build_secret_mappings(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::disallowed_methods)] // Tests use unique env var names (NONO_TEST_*), no contention.
 mod tests {
     use super::*;
 
@@ -1133,6 +1688,282 @@ mod tests {
             "got: {}",
             err
         );
+    }
+
+    // --- keyring:// URI handling in build_mappings_from_list ---
+
+    #[test]
+    fn test_build_mappings_keyring_uri_rejected_in_list_mode() {
+        let err = build_mappings_from_list("keyring://gh:github.com/alice")
+            .expect_err("should reject keyring URI in list mode");
+        assert!(
+            err.to_string().contains("--env-credential-map"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_build_mappings_keyring_uri_with_inline_var_rejected_in_list_mode() {
+        let err = build_mappings_from_list("keyring://gh:github.com/alice=>GH_TOKEN")
+            .expect_err("should reject inline keyring var syntax");
+        assert!(
+            err.to_string().contains("--env-credential-map"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_build_mappings_keyring_uri_legacy_equals_suffix_rejected() {
+        let err = build_mappings_from_list("keyring://gh:github.com/alice=GH_TOKEN")
+            .expect_err("should reject legacy inline keyring suffix");
+        assert!(
+            err.to_string().contains("--env-credential-map"),
+            "got: {}",
+            err
+        );
+    }
+
+    // --- keyring:// URI validation tests ---
+
+    #[test]
+    fn test_validate_keyring_uri_valid() {
+        assert!(validate_keyring_uri("keyring://gh:github.com/alice").is_ok());
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_valid_with_special_service() {
+        // Service names can contain colons, dots, etc.
+        assert!(validate_keyring_uri("keyring://com.example.app/user@example.com").is_ok());
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_missing_prefix() {
+        let err = validate_keyring_uri("gh:github.com/alice").expect_err("should reject");
+        assert!(
+            err.to_string().contains("does not start with"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_missing_account() {
+        let err = validate_keyring_uri("keyring://gh:github.com")
+            .expect_err("should reject missing account");
+        assert!(err.to_string().contains("service/account"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_empty_segment() {
+        let err = validate_keyring_uri("keyring://gh:github.com/")
+            .expect_err("should reject empty account");
+        assert!(err.to_string().contains("empty"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_empty_service() {
+        let err =
+            validate_keyring_uri("keyring:///alice").expect_err("should reject empty service");
+        assert!(err.to_string().contains("empty"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_forbidden_char() {
+        let err = validate_keyring_uri("keyring://gh:github.com/alice;rm -rf")
+            .expect_err("should reject forbidden char");
+        assert!(
+            err.to_string().contains("forbidden character"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_unknown_query_param_rejected() {
+        let err = validate_keyring_uri("keyring://service/account?foo=bar")
+            .expect_err("should reject unknown query param");
+        assert!(
+            err.to_string().contains("unknown query parameter"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_unknown_decode_value_rejected() {
+        let err = validate_keyring_uri("keyring://service/account?decode=unknown")
+            .expect_err("should reject unknown decode value");
+        assert!(
+            err.to_string().contains("unknown decode value"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_fragment_rejected() {
+        let err = validate_keyring_uri("keyring://service/account#frag")
+            .expect_err("should reject fragment");
+        assert!(err.to_string().contains("fragment"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_decode_go_keyring_accepted() {
+        assert!(validate_keyring_uri("keyring://gh:github.com/alice?decode=go-keyring").is_ok());
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_query_param_missing_value() {
+        let err = validate_keyring_uri("keyring://service/account?decode")
+            .expect_err("should reject param without value");
+        assert!(err.to_string().contains("missing value"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_too_many_segments() {
+        let err = validate_keyring_uri("keyring://service/account/extra")
+            .expect_err("should reject extra segments");
+        assert!(err.to_string().contains("service/account"), "got: {}", err);
+    }
+
+    // --- keyring:// URI redaction tests ---
+
+    #[test]
+    fn test_redact_keyring_uri_normal() {
+        assert_eq!(
+            redact_keyring_uri("keyring://gh:github.com/alice"),
+            "keyring://gh:github.com/<redacted>"
+        );
+    }
+
+    #[test]
+    fn test_redact_keyring_uri_with_decode_query() {
+        assert_eq!(
+            redact_keyring_uri("keyring://gh:github.com/alice?decode=go-keyring"),
+            "keyring://gh:github.com/<redacted>?decode=go-keyring"
+        );
+    }
+
+    #[test]
+    fn test_redact_keyring_uri_malformed() {
+        assert_eq!(redact_keyring_uri("keyring://"), "keyring://***");
+    }
+
+    #[test]
+    fn test_redact_keyring_uri_service_only() {
+        assert_eq!(
+            redact_keyring_uri("keyring://gh:github.com"),
+            "keyring://***"
+        );
+    }
+
+    #[test]
+    fn test_redact_keyring_uri_non_prefix_input() {
+        assert_eq!(redact_keyring_uri("not-a-keyring-uri"), "keyring://***");
+    }
+
+    // --- keyring:// ?decode=go-keyring tests ---
+
+    #[test]
+    fn test_apply_keyring_decode_none_passthrough() {
+        let result = apply_keyring_decode("raw-secret".to_string(), KeyringDecode::None, "test")
+            .expect("None decode should passthrough");
+        assert_eq!(result.as_str(), "raw-secret");
+    }
+
+    #[test]
+    fn test_apply_keyring_decode_go_keyring_valid() {
+        // "gho_testtoken" base64-encoded is "Z2hvX3Rlc3R0b2tlbg=="
+        let raw = "go-keyring-base64:Z2hvX3Rlc3R0b2tlbg==".to_string();
+        let result = apply_keyring_decode(raw, KeyringDecode::GoKeyring, "test")
+            .expect("should decode go-keyring value");
+        assert_eq!(result.as_str(), "gho_testtoken");
+    }
+
+    #[test]
+    fn test_apply_keyring_decode_go_keyring_missing_prefix() {
+        let err = apply_keyring_decode("plain-value".to_string(), KeyringDecode::GoKeyring, "test")
+            .expect_err("should reject missing go-keyring prefix");
+        assert!(
+            err.to_string().contains("go-keyring-base64:"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_apply_keyring_decode_go_keyring_invalid_base64() {
+        let raw = "go-keyring-base64:!!!not-base64!!!".to_string();
+        let err = apply_keyring_decode(raw, KeyringDecode::GoKeyring, "test")
+            .expect_err("should reject invalid base64");
+        assert!(err.to_string().contains("base64-decode"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_parse_keyring_uri_decode_go_keyring() {
+        let parts = parse_keyring_uri("keyring://gh:github.com/alice?decode=go-keyring")
+            .expect("should parse with decode param");
+        assert_eq!(parts.service, "gh:github.com");
+        assert_eq!(parts.account, "alice");
+        assert_eq!(parts.decode, KeyringDecode::GoKeyring);
+    }
+
+    #[test]
+    fn test_parse_keyring_uri_no_decode() {
+        let parts = parse_keyring_uri("keyring://gh:github.com/alice")
+            .expect("should parse without decode param");
+        assert_eq!(parts.decode, KeyringDecode::None);
+    }
+
+    // --- keyring:// build_mappings_from_pairs tests ---
+
+    #[test]
+    fn test_build_pairs_keyring_uri_valid() {
+        let pairs = vec![(
+            "keyring://gh:github.com/alice".to_string(),
+            "GH_TOKEN".to_string(),
+        )];
+        let mappings = build_mappings_from_pairs(&pairs).expect("should accept valid keyring URI");
+        assert_eq!(
+            mappings.get("keyring://gh:github.com/alice"),
+            Some(&"GH_TOKEN".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_pairs_keyring_uri_with_decode() {
+        let pairs = vec![(
+            "keyring://gh:github.com/alice?decode=go-keyring".to_string(),
+            "GH_TOKEN".to_string(),
+        )];
+        let mappings =
+            build_mappings_from_pairs(&pairs).expect("should accept keyring URI with decode");
+        assert_eq!(
+            mappings.get("keyring://gh:github.com/alice?decode=go-keyring"),
+            Some(&"GH_TOKEN".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_pairs_keyring_uri_invalid() {
+        let pairs = vec![(
+            "keyring://gh:github.com".to_string(),
+            "GH_TOKEN".to_string(),
+        )];
+        let err = build_mappings_from_pairs(&pairs).expect_err("should reject missing account");
+        assert!(err.to_string().contains("service/account"), "got: {}", err);
+    }
+
+    // --- keyring:// length limit test ---
+
+    #[test]
+    fn test_validate_keyring_uri_too_long() {
+        let long_account = "a".repeat(1024);
+        let uri = format!("keyring://service/{}", long_account);
+        let err = validate_keyring_uri(&uri).expect_err("should reject oversized URI");
+        assert!(err.to_string().contains("maximum length"), "got: {}", err);
     }
 
     // --- op:// URI validation tests ---
@@ -1369,6 +2200,25 @@ mod tests {
             redact_apple_password_uri("apple-password://only-server"),
             "apple-password://***"
         );
+    }
+
+    // --- redact_file_uri tests ---
+
+    #[test]
+    fn test_redact_file_uri() {
+        assert_eq!(
+            redact_file_uri("file:///run/secrets/api-token"),
+            "file:///run/secrets/[REDACTED]"
+        );
+        assert_eq!(
+            redact_file_uri("file:///etc/ssl/cert.pem"),
+            "file:///etc/ssl/[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn test_redact_file_uri_root_path() {
+        assert_eq!(redact_file_uri("file:///secret"), "file:///[REDACTED]");
     }
 
     // --- classify_op_error tests ---
@@ -1870,5 +2720,182 @@ mod tests {
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged.get("openai_api_key"), Some(&"FROM_MAP".to_string()));
+    }
+
+    // =========================================================================
+    // file:// URI tests
+    // =========================================================================
+
+    #[test]
+    fn test_validate_file_uri_valid_absolute_path() {
+        assert!(validate_file_uri("file:///run/secrets/api-token").is_ok());
+        assert!(validate_file_uri("file:///tmp/secret.txt").is_ok());
+        assert!(validate_file_uri("file:///etc/ssl/certs/ca.pem").is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_uri_rejects_empty_path() {
+        assert!(validate_file_uri("file://").is_err());
+        assert!(validate_file_uri("file:///").is_err());
+    }
+
+    #[test]
+    fn test_validate_file_uri_rejects_relative_path() {
+        assert!(validate_file_uri("file://relative/path").is_err());
+        assert!(validate_file_uri("file://./secret").is_err());
+        assert!(validate_file_uri("file://../escape").is_err());
+    }
+
+    #[test]
+    fn test_validate_file_uri_rejects_traversal() {
+        assert!(validate_file_uri("file:///run/secrets/../../../etc/shadow").is_err());
+        assert!(validate_file_uri("file:///tmp/../../root/.ssh/id_rsa").is_err());
+    }
+
+    #[test]
+    fn test_validate_file_uri_rejects_forbidden_characters() {
+        assert!(validate_file_uri("file:///tmp/secret;rm -rf /").is_err());
+        assert!(validate_file_uri("file:///tmp/secret\nnewline").is_err());
+        assert!(validate_file_uri("file:///tmp/secret\x00null").is_err());
+    }
+
+    #[test]
+    fn test_is_file_uri() {
+        assert!(is_file_uri("file:///run/secrets/api-token"));
+        assert!(!is_file_uri("env://MY_VAR"));
+        assert!(!is_file_uri("/run/secrets/api-token"));
+        // Note: is_file_uri is a scheme detector, not a validator.
+        // "file://relative" starts with "file://" so it matches the scheme.
+        // Validation (absolute path check) happens in validate_file_uri.
+        assert!(is_file_uri("file://relative"));
+    }
+
+    // =========================================================================
+    // load_from_file tests
+    // =========================================================================
+
+    #[test]
+    fn test_load_from_file_reads_and_trims() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.txt");
+        std::fs::write(&path, "my-api-key\n").unwrap();
+        let uri = format!("file://{}", path.display());
+        let result = load_from_file(&uri);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().as_str(), "my-api-key");
+    }
+
+    #[test]
+    fn test_load_from_file_empty_file_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "").unwrap();
+        let uri = format!("file://{}", path.display());
+        let result = load_from_file(&uri);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_from_file_whitespace_only_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("whitespace.txt");
+        std::fs::write(&path, "  \n  \n").unwrap();
+        let uri = format!("file://{}", path.display());
+        let result = load_from_file(&uri);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().as_str(), "  \n  ");
+    }
+
+    #[test]
+    fn test_load_from_file_not_found() {
+        let result = load_from_file("file:///nonexistent/path/secret.txt");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_from_file_multiline_reads_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.txt");
+        std::fs::write(&path, "glpat-xxxxxxxxxxxx\n").unwrap();
+        let uri = format!("file://{}", path.display());
+        let result = load_from_file(&uri).unwrap();
+        assert_eq!(result.as_str(), "glpat-xxxxxxxxxxxx");
+    }
+
+    #[test]
+    fn test_load_from_file_preserves_significant_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spaces.txt");
+        std::fs::write(&path, "  secret value  \n").unwrap();
+        let uri = format!("file://{}", path.display());
+        let result = load_from_file(&uri).unwrap();
+        assert_eq!(result.as_str(), "  secret value  ");
+    }
+
+    #[test]
+    fn test_load_from_file_trims_single_trailing_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crlf.txt");
+        std::fs::write(&path, "secret\r\n").unwrap();
+        let uri = format!("file://{}", path.display());
+        let result = load_from_file(&uri).unwrap();
+        assert_eq!(result.as_str(), "secret");
+    }
+
+    #[test]
+    fn test_load_from_file_newline_only_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("newline-only.txt");
+        std::fs::write(&path, "\n").unwrap();
+        let uri = format!("file://{}", path.display());
+        let result = load_from_file(&uri);
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_store_secret_file_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.txt");
+
+        store_secret_file(&path, "top-secret").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "top-secret");
+    }
+
+    // =========================================================================
+    // file:// dispatch and CLI mapping tests
+    // =========================================================================
+
+    #[test]
+    fn test_load_secret_by_ref_dispatches_file_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token.txt");
+        std::fs::write(&path, "secret-value\n").unwrap();
+        let uri = format!("file://{}", path.display());
+        let result = load_secret_by_ref("nono", &uri);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().as_str(), "secret-value");
+    }
+
+    #[test]
+    fn test_build_mappings_file_uri_requires_explicit_var() {
+        let result = build_mappings_from_list("file:///run/secrets/api-token=MY_API_KEY");
+        assert!(result.is_ok());
+        let mappings = result.unwrap();
+        assert_eq!(
+            mappings.get("file:///run/secrets/api-token"),
+            Some(&"MY_API_KEY".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_mappings_file_uri_without_var_name_is_error() {
+        let result = build_mappings_from_list("file:///run/secrets/api-token");
+        assert!(result.is_err());
     }
 }

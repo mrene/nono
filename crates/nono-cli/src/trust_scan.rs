@@ -423,6 +423,37 @@ pub fn run_pre_exec_scan(
         results.push(result);
     }
 
+    // Verify explicit `files` entries from the trust policy.
+    // These are absolute paths (with optional `~` expansion) that live outside
+    // the working directory, such as shared AI agent skills.
+    for raw_path in &policy.files {
+        let expanded = expand_home(raw_path);
+        let file_path = std::path::PathBuf::from(&expanded);
+
+        // Skip if already verified via the multi-subject bundle above
+        if let Ok(canon) = std::fs::canonicalize(&file_path) {
+            if multi_verified_paths.contains(&canon) {
+                continue;
+            }
+        }
+
+        let result = verify_instruction_file(&file_path, policy);
+
+        if !silent {
+            print_verification_line(&file_path, scan_root, &result, policy.enforcement);
+        }
+
+        if result.outcome.is_verified() {
+            verified = verified.saturating_add(1);
+        } else if result.outcome.should_block(policy.enforcement) {
+            blocked = blocked.saturating_add(1);
+        } else {
+            warned = warned.saturating_add(1);
+        }
+
+        results.push(result);
+    }
+
     if !silent && !results.is_empty() {
         print_scan_summary(verified, blocked, warned, policy.enforcement);
     }
@@ -433,6 +464,23 @@ pub fn run_pre_exec_scan(
         blocked,
         warned,
     })
+}
+
+/// Expand a leading `~` to the user's home directory.
+///
+/// Returns the path unchanged if it does not start with `~` or if the home
+/// directory cannot be determined.
+fn expand_home(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().into_owned();
+        }
+    } else if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home.to_string_lossy().into_owned();
+        }
+    }
+    path.to_string()
 }
 
 /// Returns true if a pattern contains glob metacharacters (`*`, `?`, `[`, `{`).
@@ -975,6 +1023,9 @@ fn format_identity(identity: &trust::SignerIdentity) -> String {
     match identity {
         trust::SignerIdentity::Keyed { key_id } => format!("{key_id} (keyed)"),
         trust::SignerIdentity::Keyless {
+            build_signer_uri, ..
+        } if !build_signer_uri.is_empty() => build_signer_uri.clone(),
+        trust::SignerIdentity::Keyless {
             repository,
             workflow,
             ..
@@ -1197,13 +1248,19 @@ mod tests {
 
     #[test]
     fn load_scan_policy_with_trust_override_skips_verification() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         let dir = tempfile::tempdir().unwrap();
         // Isolate from the real user config dir so a stale trust-policy.json
         // on the developer's machine doesn't interfere with the test.
-        let orig_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         let xdg_dir = dir.path().join("xdg");
         std::fs::create_dir_all(&xdg_dir).unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", &xdg_dir);
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "XDG_CONFIG_HOME",
+            xdg_dir.to_str().unwrap(),
+        )]);
 
         // Create a policy file with no .bundle — should still load with trust_override=true
         std::fs::write(
@@ -1214,21 +1271,22 @@ mod tests {
 
         let policy = load_scan_policy(dir.path(), true, &[]).unwrap();
         assert_eq!(policy.enforcement, Enforcement::Warn);
-
-        match orig_xdg {
-            Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
     }
 
     #[test]
     fn load_scan_policy_skips_policy_verification_without_signed_artifacts() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         let scan_dir = tempfile::tempdir().unwrap();
         let include_pattern = "*.arbitrary";
-        let orig_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         let xdg_dir = scan_dir.path().join("xdg");
         std::fs::create_dir_all(&xdg_dir).unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", &xdg_dir);
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "XDG_CONFIG_HOME",
+            xdg_dir.to_str().unwrap(),
+        )]);
 
         std::fs::write(scan_dir.path().join("notes.arbitrary"), "unsigned").unwrap();
 
@@ -1243,11 +1301,6 @@ mod tests {
 
         let policy = load_scan_policy(scan_dir.path(), false, &[]).unwrap();
         assert!(policy.includes.contains(&include_pattern.to_string()));
-
-        match orig_xdg {
-            Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
     }
 
     #[test]
@@ -1300,6 +1353,7 @@ mod tests {
                 ref_pattern: None,
                 key_id: Some(key_id),
                 public_key: Some(pub_key_b64),
+                build_signer_uri: None,
             }],
             ..TrustPolicy::default()
         };
@@ -1348,6 +1402,7 @@ mod tests {
                 ref_pattern: None,
                 key_id: Some(key_id),
                 public_key: Some(pub_key_b64),
+                build_signer_uri: None,
             }],
             ..TrustPolicy::default()
         };
@@ -1392,6 +1447,7 @@ mod tests {
                 ref_pattern: None,
                 key_id: Some(key_id),
                 public_key: Some(pub_key_b64),
+                build_signer_uri: None,
             }],
             ..TrustPolicy::default()
         };
@@ -1429,6 +1485,7 @@ mod tests {
                 ref_pattern: None,
                 key_id: Some(key_id),
                 public_key: Some(pub_key_b64),
+                build_signer_uri: None,
             }],
             ..TrustPolicy::default()
         };
@@ -1471,6 +1528,7 @@ mod tests {
                 ref_pattern: None,
                 key_id: Some(other_key_id),
                 public_key: Some(other_pub_b64),
+                build_signer_uri: None,
             }],
             ..TrustPolicy::default()
         };

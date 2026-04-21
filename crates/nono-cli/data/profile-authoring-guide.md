@@ -64,11 +64,12 @@ Inherit from another profile by name:
 | Field                 | Type            | Default      | Description |
 |-----------------------|-----------------|--------------|-------------|
 | `groups`              | array of string | `[]`         | Policy group names from `policy.json`. Use `nono policy groups` to list available groups. |
-| `allowed_commands`    | array of string | `[]`         | Commands to allow even when blocked by deny groups (e.g., `["rm"]`). |
+| `allowed_commands`    | array of string | `[]`         | Deprecated in v0.33.0. Startup-only command allowlist override. Not enforced for child processes. |
 | `signal_mode`         | string          | `"isolated"` | One of: `"isolated"`, `"allow_same_sandbox"`, `"allow_all"`. |
 | `process_info_mode`   | string          | `"isolated"` | One of: `"isolated"`, `"allow_same_sandbox"`, `"allow_all"`. |
 | `ipc_mode`            | string          | `"shared_memory_only"` | One of: `"shared_memory_only"`, `"full"`. Use `"full"` for multiprocessing (enables POSIX semaphores). macOS only. |
 | `capability_elevation`| boolean         | `false`      | Enable runtime capability elevation via seccomp-notify. Linux only. |
+| `wsl2_proxy_policy`  | string          | `"error"`    | WSL2 only. Controls behavior when proxy-only network mode cannot be kernel-enforced. `"error"`: refuse to run (fail-secure). `"insecure_proxy"`: allow degraded execution where credential proxy runs but child is not prevented from bypassing it. See [WSL2 docs](https://nono.sh/docs/cli/internals/wsl2). |
 
 ### filesystem
 
@@ -100,7 +101,7 @@ Provides subtractive and additive composition on top of inherited groups and fil
 | `add_allow_write`    | array of string | Additional write-only path grants. |
 | `add_allow_readwrite`| array of string | Additional read+write path grants. |
 | `add_deny_access`    | array of string | Additional deny paths. |
-| `add_deny_commands`  | array of string | Command names (basename only) to block. Blocks execution of the named binaries regardless of where they are installed. Checked before the sandbox enforces filesystem rules. |
+| `add_deny_commands`  | array of string | Deprecated in v0.33.0. Startup-only command denylist extension. Not enforced for child processes; prefer `add_deny_access` and narrower grants instead. |
 | `override_deny`      | array of string | Paths to exempt from deny groups. Each path must also be granted via `filesystem` or `add_allow_*`. Does not implicitly grant access; only removes the deny rule. |
 
 ### network
@@ -127,21 +128,32 @@ Define a custom reverse proxy credential route for services not in `network-poli
   "credential_key": "example_api_key",
   "inject_mode": "header",
   "inject_header": "Authorization",
-  "credential_format": "Bearer {}"
+  "credential_format": "Bearer {}",
+  "proxy": {
+    "inject_mode": "query_param",
+    "query_param_name": "api_key"
+  }
 }
 ```
 
-| Field               | Type   | Required    | Description |
-|---------------------|--------|-------------|-------------|
-| `upstream`          | string | yes         | Upstream URL. Must be HTTPS (HTTP only for loopback). |
-| `credential_key`    | string | yes         | Keystore account name, `op://` URI, or `apple-password://` URI. |
-| `inject_mode`       | string | no          | One of: `"header"` (default), `"url_path"`, `"query_param"`, `"basic_auth"`. |
-| `inject_header`     | string | header mode | HTTP header name. Default: `"Authorization"`. |
-| `credential_format` | string | header mode | Format string with `{}` placeholder. Default: `"Bearer {}"`. |
-| `path_pattern`      | string | url_path    | Pattern to match in URL path. Use `{}` for placeholder. |
-| `path_replacement`  | string | url_path    | Replacement pattern. Defaults to `path_pattern`. |
-| `query_param_name`  | string | query_param | Query parameter name for credential injection. |
-| `env_var`           | string | URI keys    | Environment variable name for SDK API key. Required when `credential_key` is a URI. |
+| Field               | Type            | Required    | Description |
+|---------------------|-----------------|-------------|-------------|
+| `upstream`          | string          | yes         | Upstream URL. Must be HTTPS (HTTP only for loopback). |
+| `credential_key`    | string          | yes         | Keystore account name, `op://` URI, `apple-password://` URI, or `file://` URI. |
+| `inject_mode`       | string          | no          | One of: `"header"` (default), `"url_path"`, `"query_param"`, `"basic_auth"`. |
+| `inject_header`     | string          | header mode | HTTP header name. Default: `"Authorization"`. |
+| `credential_format` | string          | header mode | Format string with `{}` placeholder. Default: `"Bearer {}"`. |
+| `path_pattern`      | string          | url_path    | Pattern to match in URL path. Use `{}` for placeholder. |
+| `path_replacement`  | string          | url_path    | Replacement pattern. Defaults to `path_pattern`. |
+| `query_param_name`  | string          | query_param | Query parameter name for credential injection. |
+| `proxy`             | object          | no          | Optional proxy-side overrides for phantom token parsing. Omitted fields inherit from top-level values. |
+| `env_var`           | string          | URI keys    | Environment variable name for SDK API key. Required when `credential_key` is a URI. |
+| `endpoint_rules`    | array           | no          | L7 allow-list of `{"method": "GET", "path": "/**"}` rules. When non-empty, only matching requests are forwarded (default-deny). |
+| `tls_ca`            | string (path)   | no          | Path to a PEM-encoded CA certificate. Use for upstreams with self-signed or private CA certs (e.g. a Kubernetes API server). |
+| `tls_client_cert`   | string (path)   | no          | Path to a PEM-encoded client certificate for mutual TLS (mTLS). Must be set together with `tls_client_key`. |
+| `tls_client_key`    | string (path)   | no          | Path to the PEM-encoded private key matching `tls_client_cert`. |
+
+`proxy` overrides apply only to how the local proxy validates incoming phantom tokens from the sandboxed process. Outbound upstream credential injection continues to use top-level fields.
 
 ### env_credentials (alias: secrets)
 
@@ -161,6 +173,24 @@ Supported key formats:
 - 1Password URI: `"op://vault/item/field"`
 - Apple Passwords URI: `"apple-password://account/name"`
 - Environment reference: `"env://EXISTING_VAR"`
+
+### environment
+
+Controls which environment variables are passed to the sandboxed process. When `allow_vars` is set, only the listed variables (and nono-injected credentials) are passed through.
+
+```json
+{
+  "environment": {
+    "allow_vars": ["PATH", "HOME", "TERM", "AWS_*"]
+  }
+}
+```
+
+| Field         | Type            | Default | Description |
+|---------------|-----------------|---------|-------------|
+| `allow_vars`  | array of string | `[]`    | Allow-list of environment variable names. Supports exact names (`"PATH"`) and prefix patterns ending with `*` (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.). The `*` wildcard is only valid as a trailing suffix. When the `environment` section is omitted entirely, all variables are allowed. When present with an empty array, no inherited variables are passed (only nono-injected credentials). Nono-injected credentials always bypass this list. |
+
+Inheritance: child `allow_vars` are appended to base values and deduplicated.
 
 ### hooks
 
@@ -263,6 +293,23 @@ To replace inherited URL-opening permissions, provide `open_urls` with an explic
 }
 ```
 
+### Linux host compatibility
+
+On Linux, the built-in `default` profile keeps host runtime, sysfs, and shared temp reads out of the base policy. If your tool needs access to paths like `/run`, `/var/run`, `/sys`, or `/tmp`, extend the built-in compatibility preset:
+
+```json
+{
+  "extends": "linux-host-compat",
+  "meta": {
+    "name": "linux-desktop-agent",
+    "description": "Agent with Linux host runtime compatibility"
+  },
+  "workdir": {
+    "access": "readwrite"
+  }
+}
+```
+
 ### Profile with deny overrides
 
 When a deny group blocks a path you need access to, use `override_deny` together with an explicit grant:
@@ -327,7 +374,7 @@ With `capability_elevation` enabled, nono runs in supervised mode where every fi
 
 ### Blocking container access (Docker, Podman, kubectl)
 
-Use `add_deny_access` together with `add_deny_commands` for defense-in-depth when you want to prevent an agent from reaching the Docker daemon or similar container runtimes:
+Use `add_deny_access` to prevent an agent from reaching the Docker daemon or similar container runtimes. `add_deny_commands` is deprecated startup-only gating and should not be relied on as enforcement:
 
 ```json
 {
@@ -343,7 +390,24 @@ Use `add_deny_access` together with `add_deny_commands` for defense-in-depth whe
 }
 ```
 
-On macOS, `add_deny_access` on a socket path also emits a Seatbelt `network-outbound` deny — Seatbelt treats `connect(2)` as a network operation so a file deny alone won't block it. `add_deny_commands` blocks the CLI tools as defense-in-depth, catching cases where an agent reaches the daemon through a forwarded or alternate socket path. Both are visible in `nono policy show` under **Policy patches**.
+On macOS, `add_deny_access` on a socket path also emits a Seatbelt `network-outbound` deny — Seatbelt treats `connect(2)` as a network operation so a file deny alone won't block it. Prefer path- and network-based controls; `add_deny_commands` remains as deprecated startup-only compatibility behavior and is visible in `nono policy show` under **Policy patches**.
+
+### Allowing parent-of-protected-root grants (macOS only)
+
+By default, granting a parent directory of `~/.nono` (e.g. `--allow ~`) is rejected because it would expose nono's internal state. On macOS, Seatbelt can express deny-within-allow rules, so this restriction can be relaxed when the profile opts in with `allow_parent_of_protected`:
+
+```json
+{
+  "extends": "claude-code",
+  "meta": {
+    "name": "home-access",
+    "description": "Claude Code with full home directory access"
+  },
+  "allow_parent_of_protected": true
+}
+```
+
+When `allow_parent_of_protected` is `true` and the platform is macOS, nono permits the parent grant and emits Seatbelt deny rules that protect `~/.nono` from reads and writes. On Linux this field is ignored — Landlock cannot deny a child of an allowed parent, so the pre-flight check always rejects parent-of-protected grants.
 
 ### Profile with group exclusion
 
@@ -412,8 +476,12 @@ The following variables are expanded in all path fields (`filesystem.*`, `policy
 | `$HOME`            | User's home directory |
 | `$WORKDIR`         | Working directory (from `--workdir` flag or cwd) |
 | `$TMPDIR`          | System temporary directory |
+| `$UID`             | Current user ID |
 | `$XDG_CONFIG_HOME` | XDG config directory (default: `$HOME/.config`) |
 | `$XDG_DATA_HOME`   | XDG data directory (default: `$HOME/.local/share`) |
+| `$XDG_STATE_HOME`  | XDG state directory (default: `$HOME/.local/state`) |
+| `$XDG_CACHE_HOME`  | XDG cache directory (default: `$HOME/.cache`) |
+| `$XDG_RUNTIME_DIR` | XDG runtime directory (no default; left unexpanded when unset) |
 
 Always use these variables instead of hardcoded absolute paths to keep profiles portable across machines and users.
 

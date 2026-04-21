@@ -104,10 +104,11 @@ pub fn query_path(
             return Ok(QueryResult::Denied {
                 reason: "sensitive_path".to_string(),
                 details: Some(format!(
-                    "Path is blocked by security policy: {}. It cannot be granted with path flags alone.",
-                    matched
+                    "Path is blocked by security policy group '{}' ({}). It cannot be granted with path flags alone. If you need an exception, use a profile with policy.override_deny plus an explicit filesystem grant.",
+                    matched.group_name,
+                    matched.description
                 )),
-                policy_source: Some(matched),
+                policy_source: Some(format!("group:{}", matched.group_name)),
                 matching_capability: None,
                 suggested_flag: None,
             });
@@ -445,6 +446,10 @@ mod tests {
 
     #[test]
     fn test_query_path_sensitive_policy_includes_policy_source() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let ssh_path = PathBuf::from(format!(
             "{}/.ssh",
             crate::config::validated_home().expect("HOME should be valid in test")
@@ -457,10 +462,16 @@ mod tests {
                 reason,
                 policy_source,
                 suggested_flag,
+                details,
                 ..
             } => {
                 assert_eq!(reason, "sensitive_path");
-                assert!(policy_source.is_some());
+                assert!(policy_source
+                    .as_deref()
+                    .is_some_and(|policy| policy.starts_with("group:")));
+                assert!(details
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("policy.override_deny")));
                 assert!(suggested_flag.is_none());
             }
             _ => panic!("expected denied result"),

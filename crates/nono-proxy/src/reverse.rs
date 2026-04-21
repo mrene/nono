@@ -19,6 +19,7 @@ use crate::config::InjectMode;
 use crate::credential::{CredentialStore, LoadedCredential};
 use crate::error::{ProxyError, Result};
 use crate::filter::ProxyFilter;
+use crate::route::RouteStore;
 use crate::token;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -40,7 +41,9 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// a configured route, injects credentials, and forwards to the upstream.
 /// Shared context passed from the server to the reverse proxy handler.
 pub struct ReverseProxyCtx<'a> {
-    /// Credential store for service lookups
+    /// Route store for upstream URL, L7 filtering, and per-route TLS
+    pub route_store: &'a RouteStore,
+    /// Credential store for service lookups (optional injection)
     pub credential_store: &'a CredentialStore,
     /// Session token for authentication
     pub session_token: &'a Zeroizing<String>,
@@ -78,28 +81,76 @@ pub async fn handle_reverse_proxy(
 
     // Extract service prefix from path (e.g., "/openai/v1/chat" -> ("openai", "/v1/chat"))
     let (service, upstream_path) = parse_service_prefix(&path)?;
-
-    // Look up credential for service
-    let cred = ctx
-        .credential_store
+    let route = ctx
+        .route_store
         .get(&service)
         .ok_or_else(|| ProxyError::UnknownService {
             prefix: service.clone(),
         })?;
+    let static_cred = ctx.credential_store.get(&service);
+    let oauth2_route = ctx.credential_store.get_oauth2(&service);
 
-    // Validate phantom token based on injection mode.
-    // For header/basic_auth modes: validate from Authorization/x-api-key header
-    // For url_path mode: validate from URL path pattern
-    // For query_param mode: validate from query parameter
-    if let Err(e) = validate_phantom_token_for_mode(
-        &cred.inject_mode,
-        remaining_header,
-        &upstream_path,
-        &cred.header_name,
-        cred.path_pattern.as_deref(),
-        cred.query_param_name.as_deref(),
-        ctx.session_token,
-    ) {
+    // L7 endpoint filtering runs for all reverse-proxy routes, whether or not
+    // they inject a credential.
+    if !route.endpoint_rules.is_allowed(&method, &upstream_path) {
+        let reason = format!(
+            "endpoint denied: {} {} on service '{}'",
+            method, upstream_path, service
+        );
+        warn!("{}", reason);
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            &service,
+            0,
+            &reason,
+        );
+        send_error(stream, 403, "Forbidden").await?;
+        return Ok(());
+    }
+
+    if let Some(oauth2_route) = oauth2_route {
+        return handle_oauth2_credential(
+            oauth2_route,
+            route,
+            &service,
+            &upstream_path,
+            &method,
+            &version,
+            stream,
+            remaining_header,
+            buffered_body,
+            ctx,
+        )
+        .await;
+    }
+
+    let cred = static_cred;
+
+    // Authenticate the request. Every reverse proxy request must prove
+    // possession of the session token, regardless of whether a credential
+    // is configured — this is the localhost auth boundary.
+    if let Some(cred) = cred {
+        if let Err(e) = validate_phantom_token_for_mode(
+            &cred.proxy_inject_mode,
+            remaining_header,
+            &upstream_path,
+            &cred.proxy_header_name,
+            cred.proxy_path_pattern.as_deref(),
+            cred.proxy_query_param_name.as_deref(),
+            ctx.session_token,
+        ) {
+            audit::log_denied(
+                ctx.audit_log,
+                audit::ProxyMode::Reverse,
+                &service,
+                0,
+                &e.to_string(),
+            );
+            send_error(stream, 401, "Unauthorized").await?;
+            return Ok(());
+        }
+    } else if let Err(e) = token::validate_proxy_auth(remaining_header, ctx.session_token) {
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Reverse,
@@ -107,31 +158,38 @@ pub async fn handle_reverse_proxy(
             0,
             &e.to_string(),
         );
-        send_error(stream, 401, "Unauthorized").await?;
+        send_error(stream, 407, "Proxy Authentication Required").await?;
         return Ok(());
     }
 
-    // Transform the path based on injection mode (url_path and query_param modes)
-    let transformed_path = transform_path_for_mode(
-        &cred.inject_mode,
-        &upstream_path,
-        cred.path_pattern.as_deref(),
-        cred.path_replacement.as_deref(),
-        cred.query_param_name.as_deref(),
-        &cred.raw_credential,
-    )?;
+    let transformed_path = if let Some(cred) = cred {
+        let cleaned_path = strip_proxy_artifacts(
+            &upstream_path,
+            &cred.proxy_inject_mode,
+            &cred.inject_mode,
+            cred.proxy_path_pattern.as_deref(),
+            cred.proxy_query_param_name.as_deref(),
+        );
+        transform_path_for_mode(
+            &cred.inject_mode,
+            &cleaned_path,
+            cred.path_pattern.as_deref(),
+            cred.path_replacement.as_deref(),
+            cred.query_param_name.as_deref(),
+            &cred.raw_credential,
+        )?
+    } else {
+        upstream_path.clone()
+    };
 
-    // Parse upstream URL with potentially transformed path
     let upstream_url = format!(
         "{}{}",
-        cred.upstream.trim_end_matches('/'),
+        route.upstream.trim_end_matches('/'),
         transformed_path
     );
     debug!("Forwarding to upstream: {} {}", method, upstream_url);
 
     let (upstream_host, upstream_port, upstream_path_full) = parse_upstream_url(&upstream_url)?;
-
-    // DNS resolve + host check via the filter
     let check = ctx.filter.check_host(&upstream_host, upstream_port).await?;
     if !check.result.is_allowed() {
         let reason = check.result.reason();
@@ -147,41 +205,23 @@ pub async fn handle_reverse_proxy(
         return Ok(());
     }
 
-    // Collect remaining request headers (excluding X-Nono-Token and Host)
-    let filtered_headers = filter_headers(remaining_header);
+    let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
+    let filtered_headers = filter_headers(remaining_header, strip_header);
     let content_length = extract_content_length(remaining_header);
-
-    // Read request body if present, with size limit.
-    // `buffered_body` may contain bytes the BufReader read ahead beyond
-    // headers; we prepend those to avoid data loss.
-    let body = if let Some(len) = content_length {
-        if len > MAX_REQUEST_BODY {
-            send_error(stream, 413, "Payload Too Large").await?;
-            return Ok(());
-        }
-        let mut buf = Vec::with_capacity(len);
-        let pre = buffered_body.len().min(len);
-        buf.extend_from_slice(&buffered_body[..pre]);
-        let remaining = len - pre;
-        if remaining > 0 {
-            let mut rest = vec![0u8; remaining];
-            stream.read_exact(&mut rest).await?;
-            buf.extend_from_slice(&rest);
-        }
-        buf
-    } else {
-        Vec::new()
+    let body = match read_request_body(stream, content_length, buffered_body).await? {
+        Some(body) => body,
+        None => return Ok(()),
     };
 
-    // Connect to upstream over TLS using pre-resolved addresses
-    let upstream_result = connect_upstream_tls(
+    let connector = route.tls_connector.as_ref().unwrap_or(ctx.tls_connector);
+    let mut tls_stream = match connect_upstream_tls(
         &upstream_host,
         upstream_port,
         &check.resolved_addrs,
-        ctx.tls_connector,
+        connector,
     )
-    .await;
-    let mut tls_stream = match upstream_result {
+    .await
+    {
         Ok(s) => s,
         Err(e) => {
             warn!("Upstream connection failed: {}", e);
@@ -197,31 +237,28 @@ pub async fn handle_reverse_proxy(
         }
     };
 
-    // Build the upstream request into a Zeroizing buffer since it may contain
-    // credential values. This ensures credentials are zeroed from heap memory
-    // when the buffer is dropped.
     let mut request = Zeroizing::new(format!(
         "{} {} {}\r\nHost: {}\r\n",
         method, upstream_path_full, version, upstream_host
     ));
 
-    // Inject credential based on mode
-    inject_credential_for_mode(cred, &mut request);
+    if let Some(cred) = cred {
+        inject_credential_for_mode(cred, &mut request);
+    }
 
-    // Forward filtered headers (excluding auth headers that we're replacing)
-    let auth_header_lower = cred.header_name.to_lowercase();
+    let auth_header_lower = cred.map(|c| c.header_name.to_lowercase());
     for (name, value) in &filtered_headers {
-        // Skip the auth header if we're using header/basic_auth mode
-        // (we already injected our own)
-        if matches!(cred.inject_mode, InjectMode::Header | InjectMode::BasicAuth)
-            && name.to_lowercase() == auth_header_lower
-        {
-            continue;
+        if let (Some(cred), Some(header_lower)) = (cred, auth_header_lower.as_ref()) {
+            if matches!(cred.inject_mode, InjectMode::Header | InjectMode::BasicAuth)
+                && name.to_lowercase() == *header_lower
+            {
+                continue;
+            }
         }
         request.push_str(&format!("{}: {}\r\n", name, value));
     }
 
-    // Content-Length for body
+    request.push_str("Connection: close\r\n");
     if !body.is_empty() {
         request.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
@@ -233,8 +270,185 @@ pub async fn handle_reverse_proxy(
     }
     tls_stream.flush().await?;
 
-    // Stream the response back to the client without buffering.
-    // This handles SSE (text/event-stream), chunked transfer, and regular responses.
+    let status_code = stream_response(&mut tls_stream, stream).await?;
+    audit::log_reverse_proxy(
+        ctx.audit_log,
+        &service,
+        &method,
+        &upstream_path,
+        status_code,
+    );
+    Ok(())
+}
+
+/// Handle a reverse proxy request using an OAuth2 token cache.
+///
+/// Retrieves a (possibly refreshed) access token from the cache and injects
+/// it as `Authorization: Bearer <token>`. The agent authenticates with the
+/// session token via the `Authorization: Bearer <phantom>` header, which is
+/// validated and then replaced with the real OAuth2 access token.
+#[allow(clippy::too_many_arguments)]
+async fn handle_oauth2_credential(
+    oauth2_route: &crate::credential::OAuth2Route,
+    route: &crate::route::LoadedRoute,
+    service: &str,
+    upstream_path: &str,
+    method: &str,
+    version: &str,
+    stream: &mut TcpStream,
+    remaining_header: &[u8],
+    buffered_body: &[u8],
+    ctx: &ReverseProxyCtx<'_>,
+) -> Result<()> {
+    // Get (possibly refreshed) OAuth2 access token
+    let access_token = oauth2_route.cache.get_or_refresh().await;
+
+    // Validate session token from Authorization header (phantom token pattern).
+    // OAuth2 routes still require the agent to authenticate with the session
+    // token — this prevents unauthorized access to the token-exchanged credential.
+    if let Err(e) = validate_phantom_token(remaining_header, "Authorization", ctx.session_token) {
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            service,
+            0,
+            &e.to_string(),
+        );
+        send_error(stream, 401, "Unauthorized").await?;
+        return Ok(());
+    }
+
+    let upstream_url = format!(
+        "{}{}",
+        oauth2_route.upstream.trim_end_matches('/'),
+        upstream_path
+    );
+    debug!("OAuth2 forwarding to upstream: {} {}", method, upstream_url);
+
+    let (upstream_host, upstream_port, upstream_path_full) = parse_upstream_url(&upstream_url)?;
+
+    // DNS resolve + host check via the filter
+    let check = ctx.filter.check_host(&upstream_host, upstream_port).await?;
+    if !check.result.is_allowed() {
+        let reason = check.result.reason();
+        warn!("Upstream host denied by filter: {}", reason);
+        send_error(stream, 403, "Forbidden").await?;
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            service,
+            0,
+            &reason,
+        );
+        return Ok(());
+    }
+
+    // Collect remaining request headers, stripping the client-supplied
+    // Authorization header that carries the phantom token.
+    let filtered_headers = filter_headers(remaining_header, "Authorization");
+    let content_length = extract_content_length(remaining_header);
+
+    // Read request body
+    let body = match read_request_body(stream, content_length, buffered_body).await? {
+        Some(body) => body,
+        None => return Ok(()),
+    };
+
+    // Connect to upstream over TLS, honoring any per-route custom CA / mTLS.
+    let connector = route.tls_connector.as_ref().unwrap_or(ctx.tls_connector);
+    let mut tls_stream = match connect_upstream_tls(
+        &upstream_host,
+        upstream_port,
+        &check.resolved_addrs,
+        connector,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Upstream connection failed: {}", e);
+            send_error(stream, 502, "Bad Gateway").await?;
+            audit::log_denied(
+                ctx.audit_log,
+                audit::ProxyMode::Reverse,
+                service,
+                0,
+                &e.to_string(),
+            );
+            return Ok(());
+        }
+    };
+
+    // Build upstream request with Bearer token injection
+    let mut request = Zeroizing::new(format!(
+        "{} {} {}\r\nHost: {}\r\n",
+        method, upstream_path_full, version, upstream_host
+    ));
+
+    // Inject OAuth2 access token as Authorization: Bearer
+    request.push_str(&format!(
+        "Authorization: Bearer {}\r\n",
+        access_token.as_str()
+    ));
+
+    // Forward filtered headers (auth headers already stripped by filter_headers)
+    for (name, value) in &filtered_headers {
+        request.push_str(&format!("{}: {}\r\n", name, value));
+    }
+
+    if !body.is_empty() {
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
+
+    tls_stream.write_all(request.as_bytes()).await?;
+    if !body.is_empty() {
+        tls_stream.write_all(&body).await?;
+    }
+    tls_stream.flush().await?;
+
+    // Stream the response back
+    let status_code = stream_response(&mut tls_stream, stream).await?;
+
+    audit::log_reverse_proxy(ctx.audit_log, service, method, upstream_path, status_code);
+    Ok(())
+}
+
+/// Read request body from the client stream with size limit.
+///
+/// `buffered_body` contains bytes the BufReader read ahead beyond headers.
+async fn read_request_body(
+    stream: &mut TcpStream,
+    content_length: Option<usize>,
+    buffered_body: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    if let Some(len) = content_length {
+        if len > MAX_REQUEST_BODY {
+            send_error(stream, 413, "Payload Too Large").await?;
+            return Ok(None);
+        }
+        let mut buf = Vec::with_capacity(len);
+        let pre = buffered_body.len().min(len);
+        buf.extend_from_slice(&buffered_body[..pre]);
+        let remaining = len - pre;
+        if remaining > 0 {
+            let mut rest = vec![0u8; remaining];
+            stream.read_exact(&mut rest).await?;
+            buf.extend_from_slice(&rest);
+        }
+        Ok(Some(buf))
+    } else {
+        Ok(Some(Vec::new()))
+    }
+}
+
+/// Stream the upstream TLS response back to the client.
+///
+/// Returns the HTTP status code parsed from the first chunk.
+async fn stream_response(
+    tls_stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
+    stream: &mut TcpStream,
+) -> Result<u16> {
     let mut response_buf = [0u8; 8192];
     let mut status_code: u16 = 502;
     let mut first_chunk = true;
@@ -249,9 +463,6 @@ pub async fn handle_reverse_proxy(
             }
         };
 
-        // Parse status from first chunk. The HTTP status line format is:
-        // "HTTP/1.1 200 OK\r\n..." — we need the 3-digit code after the
-        // first space. We scan up to 32 bytes (enough for any valid status line).
         if first_chunk {
             status_code = parse_response_status(&response_buf[..n]);
             first_chunk = false;
@@ -261,14 +472,7 @@ pub async fn handle_reverse_proxy(
         stream.flush().await?;
     }
 
-    audit::log_reverse_proxy(
-        ctx.audit_log,
-        &service,
-        &method,
-        &upstream_path,
-        status_code,
-    );
-    Ok(())
+    Ok(status_code)
 }
 
 /// Parse an HTTP request line into (method, path, version).
@@ -345,22 +549,33 @@ fn validate_phantom_token(
     Err(ProxyError::InvalidToken)
 }
 
-/// Filter headers, removing Host, Content-Length, and auth headers.
+/// Filter headers, removing hop-by-hop and proxy-internal headers.
 ///
-/// Content-Length is re-added after body is read, and Host is rewritten
-/// to the upstream. Authorization and x-api-key headers are stripped since
-/// we inject our own credential (the phantom token is validated but not forwarded).
-fn filter_headers(header_bytes: &[u8]) -> Vec<(String, String)> {
+/// Always strips:
+/// - `Host` (rewritten to upstream)
+/// - `Content-Length` (re-added after body is read)
+/// - `Proxy-Authorization` (hop-by-hop, contains session token)
+///
+/// When `cred_header` is non-empty, also strips that header (it contains
+/// the phantom token that must not be forwarded alongside the real credential).
+/// When `cred_header` is empty (no-credential route), all other headers
+/// including `Authorization` are passed through to the upstream.
+fn filter_headers(header_bytes: &[u8], cred_header: &str) -> Vec<(String, String)> {
     let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
+    let cred_header_lower = if cred_header.is_empty() {
+        String::new()
+    } else {
+        format!("{}:", cred_header.to_lowercase())
+    };
     let mut headers = Vec::new();
 
     for line in header_str.lines() {
         let lower = line.to_lowercase();
         if lower.starts_with("host:")
             || lower.starts_with("content-length:")
-            || lower.starts_with("authorization:")
-            || lower.starts_with("x-api-key:")
-            || lower.starts_with("x-goog-api-key:")
+            || lower.starts_with("connection:")
+            || lower.starts_with("proxy-authorization:")
+            || (!cred_header_lower.is_empty() && lower.starts_with(&cred_header_lower))
             || line.trim().is_empty()
         {
             continue;
@@ -809,6 +1024,132 @@ fn transform_query_param(
     }
 }
 
+/// Strip proxy-side artifacts from the path when proxy and upstream modes differ.
+///
+/// When the proxy validates the phantom token using a different injection mode
+/// than the upstream (e.g., proxy uses `url_path` or `query_param` while upstream
+/// uses `header`), the proxy-side token is embedded in the URL. This function
+/// removes it before the path is forwarded to the upstream, preventing phantom
+/// token leakage.
+///
+/// When both modes are the same, the upstream transform handles replacement
+/// (phantom → real credential), so no stripping is needed.
+fn strip_proxy_artifacts(
+    path: &str,
+    proxy_mode: &InjectMode,
+    upstream_mode: &InjectMode,
+    proxy_path_pattern: Option<&str>,
+    proxy_query_param_name: Option<&str>,
+) -> String {
+    // Only strip when modes differ — same-mode cases are handled by the
+    // upstream transform which replaces the phantom token with the real one.
+    if proxy_mode == upstream_mode {
+        return path.to_string();
+    }
+
+    match proxy_mode {
+        InjectMode::UrlPath => {
+            if let Some(pattern) = proxy_path_pattern {
+                strip_proxy_path_token(path, pattern)
+            } else {
+                path.to_string()
+            }
+        }
+        InjectMode::QueryParam => {
+            if let Some(param_name) = proxy_query_param_name {
+                strip_proxy_query_param(path, param_name)
+            } else {
+                path.to_string()
+            }
+        }
+        // Header and BasicAuth modes don't embed artifacts in the URL path.
+        InjectMode::Header | InjectMode::BasicAuth => path.to_string(),
+    }
+}
+
+/// Remove a phantom token path segment matched by the given pattern.
+///
+/// Example: path `/TOKEN123/api/v1/pods` with pattern `/{}/` → `/api/v1/pods`
+fn strip_proxy_path_token(path: &str, pattern: &str) -> String {
+    let parts: Vec<&str> = pattern.split("{}").collect();
+    if parts.len() != 2 {
+        return path.to_string();
+    }
+    let (prefix, suffix) = (parts[0], parts[1]);
+
+    // Prefer matching at the start of the path to avoid false hits on
+    // common prefixes like "/" that would otherwise match at position 0
+    // even if the intended token is in a later segment.
+    let start = if path.starts_with(prefix) {
+        Some(0)
+    } else {
+        path.find(prefix)
+    };
+
+    if let Some(start) = start {
+        let after_prefix = start + prefix.len();
+        let end_offset = if suffix.is_empty() {
+            path[after_prefix..]
+                .find(['/', '?'])
+                .unwrap_or(path[after_prefix..].len())
+        } else {
+            match path[after_prefix..].find(suffix) {
+                Some(offset) => offset,
+                None => return path.to_string(),
+            }
+        };
+
+        let before = &path[..start];
+        let after = &path[after_prefix + end_offset + suffix.len()..];
+
+        // Join before and after with exactly one separator to avoid
+        // malformed paths: "/prefixapi" (missing slash) or "/api//v1"
+        // (double slash) when the stripped segment was mid-path.
+        let joined = match (before.ends_with('/'), after.starts_with('/')) {
+            (true, true) => format!("{}{}", before, &after[1..]),
+            (false, false) if !before.is_empty() && !after.is_empty() => {
+                format!("{}/{}", before, after)
+            }
+            _ => format!("{}{}", before, after),
+        };
+
+        if joined.is_empty() || !joined.starts_with('/') {
+            format!("/{}", joined)
+        } else {
+            joined
+        }
+    } else {
+        path.to_string()
+    }
+}
+
+/// Remove a phantom token query parameter from the URL.
+///
+/// Example: path `/api/v1/pods?token=XXX&limit=10` → `/api/v1/pods?limit=10`
+fn strip_proxy_query_param(path: &str, param_name: &str) -> String {
+    if let Some(query_start) = path.find('?') {
+        let base_path = &path[..query_start];
+        let query = &path[query_start + 1..];
+
+        let remaining: Vec<&str> = query
+            .split('&')
+            .filter(|pair| {
+                pair.split_once('=')
+                    .map(|(name, _)| name != param_name)
+                    .unwrap_or(true)
+            })
+            .collect();
+
+        if remaining.is_empty() {
+            base_path.to_string()
+        } else {
+            format!("{}?{}", base_path, remaining.join("&"))
+        }
+    } else {
+        path.to_string()
+    }
+}
+
 /// Inject credential into request based on mode.
 ///
 /// For header/basic_auth modes, adds the credential header.
@@ -907,7 +1248,7 @@ mod tests {
     #[test]
     fn test_filter_headers_removes_host_auth() {
         let header = b"Host: localhost:8080\r\nAuthorization: Bearer old\r\nContent-Type: application/json\r\nAccept: */*\r\n\r\n";
-        let filtered = filter_headers(header);
+        let filtered = filter_headers(header, "Authorization");
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].0, "Content-Type");
         assert_eq!(filtered[1].0, "Accept");
@@ -916,15 +1257,15 @@ mod tests {
     #[test]
     fn test_filter_headers_removes_x_api_key() {
         let header = b"x-api-key: sk-old\r\nContent-Type: application/json\r\n\r\n";
-        let filtered = filter_headers(header);
+        let filtered = filter_headers(header, "x-api-key");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].0, "Content-Type");
     }
 
     #[test]
-    fn test_filter_headers_removes_x_goog_api_key() {
-        let header = b"x-goog-api-key: gemini-key\r\nContent-Type: application/json\r\n\r\n";
-        let filtered = filter_headers(header);
+    fn test_filter_headers_removes_custom_header() {
+        let header = b"PRIVATE-TOKEN: phantom123\r\nContent-Type: application/json\r\n\r\n";
+        let filtered = filter_headers(header, "PRIVATE-TOKEN");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].0, "Content-Type");
     }
@@ -1127,5 +1468,256 @@ mod tests {
         let path = "/api/data";
         let result = transform_query_param(path, "api_key", &credential).unwrap();
         assert_eq!(result, "/api/data?api_key=key%20with%20spaces");
+    }
+
+    #[test]
+    fn test_validate_phantom_token_uses_proxy_mode_over_upstream_mode() {
+        let token = Zeroizing::new("session123".to_string());
+        let header = b"Authorization: Bearer session123\r\n\r\n";
+        let path = "/api/data?api_key=wrong";
+
+        // Simulate split config where proxy-side mode is header while upstream
+        // mode might be query_param.
+        let result = validate_phantom_token_for_mode(
+            &InjectMode::Header,
+            header,
+            path,
+            "Authorization",
+            None,
+            Some("api_key"),
+            &token,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_transform_path_uses_upstream_mode_independently() {
+        let credential = Zeroizing::new("real_key".to_string());
+        let path = "/api/data?api_key=phantom";
+
+        // Simulate split config where upstream mode is query_param.
+        let transformed = transform_path_for_mode(
+            &InjectMode::QueryParam,
+            path,
+            None,
+            None,
+            Some("api_key"),
+            &credential,
+        )
+        .expect("query-param transform should succeed");
+
+        assert_eq!(transformed, "/api/data?api_key=real_key");
+    }
+
+    // ========================================================================
+    // Proxy artifact stripping tests
+    // ========================================================================
+
+    #[test]
+    fn test_strip_proxy_path_token_basic() {
+        // Pattern: /{}/  — token is the first path segment
+        let result = strip_proxy_path_token("/PHANTOM123/api/v1/pods", "/{}/");
+        assert_eq!(result, "/api/v1/pods");
+    }
+
+    #[test]
+    fn test_strip_proxy_path_token_nested_pattern() {
+        // Pattern: /auth/{}/  — token is in a nested segment
+        let result = strip_proxy_path_token("/auth/PHANTOM123/api/v1/pods", "/auth/{}/");
+        assert_eq!(result, "/api/v1/pods");
+    }
+
+    #[test]
+    fn test_strip_proxy_path_token_no_trailing_slash() {
+        // Pattern: /{}  — token at end of path with no trailing content
+        let result = strip_proxy_path_token("/PHANTOM123", "/{}");
+        assert_eq!(result, "/");
+    }
+
+    #[test]
+    fn test_strip_proxy_path_token_preserves_query() {
+        // Pattern: /{}/  — should preserve query string after stripping
+        let result = strip_proxy_path_token("/PHANTOM123/api?limit=10", "/{}/");
+        assert_eq!(result, "/api?limit=10");
+    }
+
+    #[test]
+    fn test_strip_proxy_path_token_no_match() {
+        // Pattern doesn't match — return path unchanged
+        let result = strip_proxy_path_token("/api/v1/pods", "/auth/{}/");
+        assert_eq!(result, "/api/v1/pods");
+    }
+
+    #[test]
+    fn test_strip_proxy_path_token_mid_path_slash_join() {
+        // Token in the middle: before="/api" after="data" must join with "/"
+        let result = strip_proxy_path_token("/api/k8s/PHANTOM/data", "/k8s/{}/");
+        assert_eq!(result, "/api/data");
+    }
+
+    #[test]
+    fn test_strip_proxy_path_token_no_double_slash() {
+        // Before ends with "/" and after starts with "/" — collapse to one
+        let result = strip_proxy_path_token("/prefix/PHANTOM//suffix", "/prefix/{}/");
+        assert_eq!(result, "/suffix");
+    }
+
+    #[test]
+    fn test_strip_proxy_query_param_only_param() {
+        let result = strip_proxy_query_param("/api/v1/pods?token=PHANTOM123", "token");
+        assert_eq!(result, "/api/v1/pods");
+    }
+
+    #[test]
+    fn test_strip_proxy_query_param_with_other_params() {
+        let result = strip_proxy_query_param("/api/v1/pods?token=PHANTOM123&limit=10", "token");
+        assert_eq!(result, "/api/v1/pods?limit=10");
+    }
+
+    #[test]
+    fn test_strip_proxy_query_param_middle() {
+        let result =
+            strip_proxy_query_param("/api/v1/pods?limit=10&token=PHANTOM123&watch=true", "token");
+        assert_eq!(result, "/api/v1/pods?limit=10&watch=true");
+    }
+
+    #[test]
+    fn test_strip_proxy_query_param_no_match() {
+        let result = strip_proxy_query_param("/api/v1/pods?limit=10", "token");
+        assert_eq!(result, "/api/v1/pods?limit=10");
+    }
+
+    #[test]
+    fn test_strip_proxy_query_param_no_query_string() {
+        let result = strip_proxy_query_param("/api/v1/pods", "token");
+        assert_eq!(result, "/api/v1/pods");
+    }
+
+    #[test]
+    fn test_strip_proxy_artifacts_same_mode_noop() {
+        // When proxy and upstream use the same mode, no stripping (upstream transform handles it)
+        let path = "/PHANTOM123/api/v1/pods";
+        let result = strip_proxy_artifacts(
+            path,
+            &InjectMode::UrlPath,
+            &InjectMode::UrlPath,
+            Some("/{}/"),
+            None,
+        );
+        assert_eq!(result, path);
+    }
+
+    #[test]
+    fn test_strip_proxy_artifacts_url_path_to_header() {
+        // Proxy uses url_path, upstream uses header — must strip path token
+        let result = strip_proxy_artifacts(
+            "/PHANTOM123/api/v1/pods",
+            &InjectMode::UrlPath,
+            &InjectMode::Header,
+            Some("/{}/"),
+            None,
+        );
+        assert_eq!(result, "/api/v1/pods");
+    }
+
+    #[test]
+    fn test_strip_proxy_artifacts_query_param_to_header() {
+        // Proxy uses query_param, upstream uses header — must strip query param
+        let result = strip_proxy_artifacts(
+            "/api/v1/pods?token=PHANTOM123",
+            &InjectMode::QueryParam,
+            &InjectMode::Header,
+            None,
+            Some("token"),
+        );
+        assert_eq!(result, "/api/v1/pods");
+    }
+
+    #[test]
+    fn test_strip_proxy_artifacts_header_to_query_param() {
+        // Proxy uses header, upstream uses query_param — no URL artifacts to strip
+        let path = "/api/v1/pods";
+        let result = strip_proxy_artifacts(
+            path,
+            &InjectMode::Header,
+            &InjectMode::QueryParam,
+            None,
+            None,
+        );
+        assert_eq!(result, path);
+    }
+
+    #[test]
+    fn test_end_to_end_url_path_proxy_header_upstream() {
+        // Full flow: proxy validates via url_path, upstream injects via header.
+        // The path token must be stripped before forwarding.
+        let token = Zeroizing::new("session456".to_string());
+        let credential = Zeroizing::new("real_bearer_token".to_string());
+        let path = "/session456/api/v1/namespaces";
+
+        // 1. Proxy-side validation succeeds
+        assert!(validate_phantom_token_for_mode(
+            &InjectMode::UrlPath,
+            b"\r\n\r\n", // no auth header needed for url_path mode
+            path,
+            "Authorization",
+            Some("/{}/"),
+            None,
+            &token,
+        )
+        .is_ok());
+
+        // 2. Strip proxy artifacts
+        let cleaned = strip_proxy_artifacts(
+            path,
+            &InjectMode::UrlPath,
+            &InjectMode::Header,
+            Some("/{}/"),
+            None,
+        );
+        assert_eq!(cleaned, "/api/v1/namespaces");
+
+        // 3. Upstream transform (header mode = no path change)
+        let transformed =
+            transform_path_for_mode(&InjectMode::Header, &cleaned, None, None, None, &credential)
+                .unwrap();
+        assert_eq!(transformed, "/api/v1/namespaces");
+    }
+
+    #[test]
+    fn test_end_to_end_query_param_proxy_header_upstream() {
+        // Full flow: proxy validates via query_param, upstream injects via header.
+        let token = Zeroizing::new("session789".to_string());
+        let credential = Zeroizing::new("real_bearer_token".to_string());
+        let path = "/api/v1/pods?token=session789&limit=100";
+
+        // 1. Proxy-side validation succeeds
+        assert!(validate_phantom_token_for_mode(
+            &InjectMode::QueryParam,
+            b"\r\n\r\n",
+            path,
+            "Authorization",
+            None,
+            Some("token"),
+            &token,
+        )
+        .is_ok());
+
+        // 2. Strip proxy artifacts
+        let cleaned = strip_proxy_artifacts(
+            path,
+            &InjectMode::QueryParam,
+            &InjectMode::Header,
+            None,
+            Some("token"),
+        );
+        assert_eq!(cleaned, "/api/v1/pods?limit=100");
+
+        // 3. Upstream transform (header mode = no path change)
+        let transformed =
+            transform_path_for_mode(&InjectMode::Header, &cleaned, None, None, None, &credential)
+                .unwrap();
+        assert_eq!(transformed, "/api/v1/pods?limit=100");
     }
 }

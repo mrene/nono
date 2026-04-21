@@ -140,7 +140,7 @@
         "sigstore",
         "documentation"
       ],
-      "credentials": ["github"]
+      "credentials": ["anthropic", "github"]
     },
     "minimal": {
       "groups": [
@@ -169,7 +169,9 @@
     "anthropic": {
       "upstream": "https://api.anthropic.com",
       "inject_header": "x-api-key",
-      "credential_format": "{}"
+      "credential_format": "{}",
+      "credential_key": "env://ANTHROPIC_API_KEY",
+      "env_var": "ANTHROPIC_API_KEY"
     },
     "gemini": {
       "upstream": "https://generativelanguage.googleapis.com",

@@ -29,7 +29,7 @@ pub enum NonoError {
     #[error("No command specified")]
     NoCommand,
 
-    #[error("CWD access requires --allow-cwd in silent mode")]
+    #[error("CWD access requires --allow-cwd in non-interactive mode")]
     CwdPromptRequired,
 
     // Sandbox errors
@@ -140,6 +140,12 @@ pub enum NonoError {
     #[error("Session not found: {0}")]
     SessionNotFound(String),
 
+    #[error("Session already has an active attached client")]
+    AttachBusy,
+
+    #[error("Session exited before attach could complete")]
+    SessionGone,
+
     // Trust/attestation errors
     #[error("Trust verification failed for {path}: {reason}")]
     TrustVerification { path: String, reason: String },
@@ -155,6 +161,15 @@ pub enum NonoError {
 
     #[error("Instruction file denied: {path}: {reason}")]
     InstructionFileDenied { path: String, reason: String },
+
+    #[error("Package install error: {0}")]
+    PackageInstall(String),
+
+    #[error("Package verification failed for {package}: {reason}")]
+    PackageVerification { package: String, reason: String },
+
+    #[error("Registry error: {0}")]
+    RegistryError(String),
 
     // Network errors
     #[error("Per-port network filtering not supported on {platform}: {reason}")]

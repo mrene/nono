@@ -11,10 +11,10 @@
 //! allocation is safe) and uses only raw libc calls in the child.
 
 mod env_sanitization;
-mod pty_mux;
 #[cfg(target_os = "linux")]
 mod supervisor_linux;
 
+use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV, DETACHED_SESSION_ID_ENV};
 use nix::libc;
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -26,16 +26,19 @@ use nono::{
 };
 use std::collections::HashSet;
 use std::ffi::{CString, OsStr};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::os::fd::FromRawFd;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 pub(crate) use env_sanitization::is_dangerous_env_var;
 use env_sanitization::should_skip_env_var;
+pub(crate) use env_sanitization::validate_allow_vars_pattern;
 
 /// Resolve a program name to its absolute path.
 ///
@@ -66,6 +69,92 @@ const MAX_DENIAL_RECORDS: usize = 1000;
 /// Hard cap on request IDs tracked for replay detection.
 const MAX_TRACKED_REQUEST_IDS: usize = 4096;
 
+fn print_terminal_safe_stderr(message: &str) {
+    let mut stderr = io::stderr();
+    if stderr.is_terminal() {
+        let normalized = message.replace('\n', "\r\n");
+        let _ = writeln!(stderr, "\r{}", normalized);
+    } else {
+        let _ = writeln!(stderr, "{}", message);
+    }
+}
+
+fn prompt_startup_termination(timeout_cfg: StartupTimeoutConfig<'_>, has_output: bool) -> bool {
+    let description = if has_output {
+        format!(
+            "[nono] Startup appears blocked: `{}` has not become interactive after {} seconds.",
+            timeout_cfg.program,
+            timeout_cfg.timeout.as_secs()
+        )
+    } else {
+        format!(
+            "[nono] Startup appears blocked: `{}` produced no terminal output after {} seconds.",
+            timeout_cfg.program,
+            timeout_cfg.timeout.as_secs()
+        )
+    };
+
+    let tty_in = match std::fs::File::open("/dev/tty") {
+        Ok(file) => file,
+        Err(_) => {
+            print_terminal_safe_stderr(&format!(
+                "{}\n[nono] `{}` usually needs the built-in `{}` profile.\n[nono] Try: nono run --profile {} -- {}",
+                description,
+                timeout_cfg.program,
+                timeout_cfg.profile,
+                timeout_cfg.profile,
+                timeout_cfg.program,
+            ));
+            return false;
+        }
+    };
+
+    let mut tty_out = match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        Ok(file) => file,
+        Err(_) => {
+            print_terminal_safe_stderr(&format!(
+                "{}\n[nono] `{}` usually needs the built-in `{}` profile.\n[nono] Try: nono run --profile {} -- {}",
+                description,
+                timeout_cfg.program,
+                timeout_cfg.profile,
+                timeout_cfg.profile,
+                timeout_cfg.program,
+            ));
+            return false;
+        }
+    };
+
+    let _ = writeln!(tty_out);
+    let _ = writeln!(tty_out, "{}", description);
+    let _ = writeln!(
+        tty_out,
+        "[nono] `{}` usually needs the built-in `{}` profile.",
+        timeout_cfg.program, timeout_cfg.profile
+    );
+    let _ = writeln!(
+        tty_out,
+        "[nono] Try: nono run --profile {} -- {}",
+        timeout_cfg.profile, timeout_cfg.program
+    );
+    let _ = write!(tty_out, "[nono] Do you wish to terminate? [y/N] ");
+    let _ = tty_out.flush();
+
+    let mut reader = io::BufReader::new(tty_in);
+    let mut input = String::new();
+    if reader.read_line(&mut input).is_err() {
+        let _ = writeln!(tty_out, "\n[nono] Continuing to wait.");
+        return false;
+    }
+
+    let affirmative = matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    if affirmative {
+        let _ = writeln!(tty_out, "[nono] Terminating startup-blocked process.");
+    } else {
+        let _ = writeln!(tty_out, "[nono] Continuing to wait.");
+    }
+    affirmative
+}
+
 /// Linux procfs context for resolving child-relative procfs paths in the supervisor.
 ///
 /// `/proc/self/...` must refer to the sandboxed child process, not the unsandboxed
@@ -84,19 +173,6 @@ impl ProcfsAccessContext {
             thread_pid,
         }
     }
-}
-
-/// PTY relay state passed to supervisor loops.
-///
-/// The supervisor poll loop uses these fds to relay I/O between the real
-/// terminal and the PTY master (which is connected to the child's PTY slave).
-struct PtyRelay<'a> {
-    /// PTY master fd (connected to child's stdin/stdout/stderr)
-    master_fd: std::os::fd::RawFd,
-    /// Real terminal fd (/dev/tty)
-    real_tty_fd: std::os::fd::RawFd,
-    /// Real terminal state (for save/restore during prompts)
-    real_term: &'a pty_mux::RealTerminal,
 }
 
 /// Threading context for fork safety validation.
@@ -181,10 +257,13 @@ pub struct ExecConfig<'a> {
     pub threading: ThreadingContext,
     /// Paths that are write-protected (signed instruction files).
     pub protected_paths: &'a [std::path::PathBuf],
+    /// Optional startup timeout for known interactive CLIs that were launched
+    /// without their recommended built-in profile.
+    pub startup_timeout: Option<StartupTimeoutConfig<'a>>,
     /// Whether runtime capability elevation is enabled.
-    /// When true, the child installs seccomp-notify and the parent sets up
-    /// a PTY mux for terminal isolation during approval prompts.
-    /// When false, the child runs with static capabilities only.
+    /// When true, the child installs seccomp-notify and the parent can grant
+    /// capabilities at runtime. On macOS this is currently unused.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub capability_elevation: bool,
     /// Whether the seccomp proxy-only network fallback is needed.
     /// Set by the parent before fork when Landlock ABI lacks AccessNet
@@ -193,6 +272,21 @@ pub struct ExecConfig<'a> {
     /// sends the notify fd; parent expects to receive it.
     #[cfg(target_os = "linux")]
     pub seccomp_proxy_fallback: bool,
+    /// Allow-list of environment variable names. When set, only variables
+    /// matching an exact name or prefix pattern (e.g. `"AWS_*"`) are
+    /// passed to the child. Nono-injected credentials always bypass this.
+    pub allowed_env_vars: Option<Vec<String>>,
+    /// Unix socket paths denied by policy. Passed to the proxy filter install
+    /// so it enables sendto/sendmsg interception in addition to connect/bind.
+    #[cfg(target_os = "linux")]
+    pub denied_socket_paths: &'a [std::path::PathBuf],
+}
+
+#[derive(Clone, Copy)]
+pub struct StartupTimeoutConfig<'a> {
+    pub timeout: Duration,
+    pub program: &'a str,
+    pub profile: &'a str,
 }
 
 /// Configuration for supervisor IPC in supervised execution mode.
@@ -209,6 +303,10 @@ pub struct SupervisorConfig<'a> {
     pub approval_backend: &'a dyn ApprovalBackend,
     /// Session identifier used for audit correlation.
     pub session_id: &'a str,
+    /// Whether the launching terminal should be attached immediately.
+    pub attach_initial_client: bool,
+    /// Configured in-band PTY detach sequence.
+    pub detach_sequence: Option<&'a [u8]>,
     /// Allowed URL origins for supervisor-delegated browser opens (from profile).
     /// Empty means no URLs are allowed.
     pub open_url_origins: &'a [String],
@@ -223,11 +321,24 @@ pub struct SupervisorConfig<'a> {
     /// Bind ports allowed for seccomp proxy-only fallback.
     #[cfg(target_os = "linux")]
     pub proxy_bind_ports: Vec<u16>,
+    /// Unix socket paths that the supervisor should deny connect()/sendmsg() to.
+    /// Enforced by the seccomp proxy filter handler on Linux to block sandbox
+    /// escape via AF_UNIX sockets (e.g., SSH agent, Docker).
+    #[cfg(target_os = "linux")]
+    pub denied_socket_paths: &'a [std::path::PathBuf],
 }
 
 #[cfg(target_os = "macos")]
 fn should_install_macos_open_shim(supervisor: Option<&SupervisorConfig<'_>>) -> bool {
     supervisor.is_some_and(|cfg| !cfg.allow_launch_services_active)
+}
+
+#[cfg(target_os = "linux")]
+const fn linux_child_requires_dumpable(
+    capability_elevation: bool,
+    seccomp_proxy_fallback: bool,
+) -> bool {
+    capability_elevation || seccomp_proxy_fallback
 }
 
 /// Execute a command using the Direct strategy (exec, nono disappears).
@@ -248,9 +359,24 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
     cmd.current_dir(config.current_dir);
 
     for (key, value) in std::env::vars() {
-        if !should_skip_env_var(&key, &config.env_vars, &["NONO_CAP_FILE"]) {
-            cmd.env(&key, &value);
+        if should_skip_env_var(
+            &key,
+            &config.env_vars,
+            &[
+                "NONO_CAP_FILE",
+                DETACHED_LAUNCH_ENV,
+                DETACHED_SESSION_ID_ENV,
+                DETACHED_CWD_PROMPT_RESPONSE_ENV,
+            ],
+        ) {
+            continue;
         }
+        if let Some(ref allowed) = config.allowed_env_vars {
+            if !env_sanitization::is_env_var_allowed(&key, allowed) {
+                continue;
+            }
+        }
+        cmd.env(&key, &value);
     }
 
     cmd.args(cmd_args).env("NONO_CAP_FILE", config.cap_file);
@@ -274,8 +400,9 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
 ///
 /// - Child is sandboxed with full restrictions
 /// - Parent is NOT sandboxed - requires additional hardening:
-///   - Linux: PR_SET_DUMPABLE(0) applied BEFORE fork (inherited by both processes,
-///     closes TOCTOU window). Failure is fatal.
+///   - Linux: parent is made non-dumpable immediately after fork. The child is
+///     made non-dumpable unless seccomp-driven runtime inspection needs
+///     `/proc/PID/mem` access. Failure is fatal.
 ///   - macOS: PT_DENY_ATTACH applied in parent immediately after fork (not inherited
 ///     across fork on macOS). Failure is fatal - child is killed and error returned.
 ///
@@ -301,6 +428,9 @@ pub fn execute_supervised(
     config: &ExecConfig<'_>,
     supervisor: Option<&SupervisorConfig<'_>>,
     trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
+    on_fork: Option<&mut dyn FnMut(u32)>,
+    pty_pair: Option<crate::pty_proxy::PtyPair>,
+    pty_session_id: Option<&str>,
 ) -> Result<i32> {
     let program = &config.command[0];
     let cmd_args = &config.command[1..];
@@ -325,9 +455,22 @@ pub fn execute_supervised(
         })?);
     }
 
-    // Create supervisor socket pair if IPC is enabled.
-    // Must be done before building envp so we can add NONO_SUPERVISOR_FD.
-    let socket_pair = if supervisor.is_some() {
+    // Create supervisor socket pair only when the exec'd child actually needs
+    // to talk back to the unsandboxed parent. The supervised parent/session
+    // model still works without this socket: attach/detach uses the PTY proxy
+    // and diagnostics come from the parent wait path. On Linux, avoiding a raw
+    // inherited supervisor socket for the common "plain supervised run" path
+    // improves compatibility with CLIs that abort on unexpected inherited fds.
+    #[cfg(target_os = "linux")]
+    let needs_child_ipc = supervisor.is_some()
+        && (config.capability_elevation
+            || config.seccomp_proxy_fallback
+            || trust_interceptor.is_some());
+
+    #[cfg(not(target_os = "linux"))]
+    let needs_child_ipc = supervisor.is_some();
+
+    let socket_pair = if needs_child_ipc {
         Some(SupervisorSocket::pair()?)
     } else {
         None
@@ -337,21 +480,32 @@ pub fn execute_supervised(
     // Build environment: inherit current env + add our vars
     let mut env_c: Vec<CString> = Vec::new();
 
-    #[cfg(target_os = "macos")]
-    let mut open_shim: Option<OpenShim> = None;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut browser_shim: Option<BrowserShim> = None;
 
     // Copy current environment, filtering dangerous and overridden vars
     for (key, value) in std::env::vars_os() {
         if let (Some(k), Some(v)) = (key.to_str(), value.to_str()) {
-            let should_skip = should_skip_env_var(
+            if should_skip_env_var(
                 k,
                 &config.env_vars,
-                &["NONO_CAP_FILE", "NONO_SUPERVISOR_FD"],
-            );
-            if !should_skip {
-                if let Ok(cstr) = CString::new(format!("{}={}", k, v)) {
-                    env_c.push(cstr);
+                &[
+                    "NONO_CAP_FILE",
+                    "NONO_SUPERVISOR_FD",
+                    DETACHED_LAUNCH_ENV,
+                    DETACHED_SESSION_ID_ENV,
+                    DETACHED_CWD_PROMPT_RESPONSE_ENV,
+                ],
+            ) {
+                continue;
+            }
+            if let Some(ref allowed) = config.allowed_env_vars {
+                if !env_sanitization::is_env_var_allowed(k, allowed) {
+                    continue;
                 }
+            }
+            if let Ok(cstr) = CString::new(format!("{}={}", k, v)) {
+                env_c.push(cstr);
             }
         }
     }
@@ -374,13 +528,6 @@ pub fn execute_supervised(
         }
     }
 
-    // Add NONO_SUPERVISOR_FD if supervisor IPC is enabled
-    if let Some(fd) = child_sock_fd {
-        if let Ok(cstr) = CString::new(format!("NONO_SUPERVISOR_FD={fd}")) {
-            env_c.push(cstr);
-        }
-    }
-
     // Delegate URL opens to the unsandboxed supervisor.
     //
     // On Linux, child processes inherit Landlock restrictions so the browser
@@ -395,11 +542,14 @@ pub fn execute_supervised(
         if let Ok(nono_exe) = std::env::current_exe() {
             #[cfg(target_os = "linux")]
             {
-                let exe_str = nono_exe.display().to_string();
-                let quoted_exe = shell_quote(&exe_str);
-                let browser_cmd = format!("BROWSER={quoted_exe} open-url-helper");
-                if let Ok(cstr) = CString::new(browser_cmd) {
-                    env_c.push(cstr);
+                if let Some(fd) = child_sock_fd {
+                    if let Some(shim) = create_linux_browser_shim(&nono_exe, fd) {
+                        let browser_cmd = format!("BROWSER={}", shim.launcher.display());
+                        if let Ok(cstr) = CString::new(browser_cmd) {
+                            env_c.push(cstr);
+                        }
+                        browser_shim = Some(shim);
+                    }
                 }
             }
 
@@ -409,30 +559,32 @@ pub fn execute_supervised(
                     // Create a shim `open` script that delegates to nono open-url-helper.
                     // The npm `open` package spawns `open <url>` on macOS; by placing our
                     // shim earlier in PATH, we intercept the call.
-                    if let Some(shim) = create_open_shim(&nono_exe) {
-                        // Prepend shim dir to PATH and also set BROWSER for any tool
-                        // that does respect it.
-                        let current_path = std::env::var("PATH").unwrap_or_default();
-                        let new_path = format!("PATH={}:{current_path}", shim.dir.path().display());
-                        if let Ok(cstr) = CString::new(new_path) {
-                            // Remove existing PATH from env_c, then add our modified one
-                            env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
-                            env_c.push(cstr);
+                    if let Some(fd) = child_sock_fd {
+                        if let Some(shim) = create_open_shim(&nono_exe, fd) {
+                            // Prepend shim dir to PATH and also set BROWSER for any tool
+                            // that does respect it.
+                            let current_path = std::env::var("PATH").unwrap_or_default();
+                            let new_path =
+                                format!("PATH={}:{current_path}", shim.dir.path().display());
+                            if let Ok(cstr) = CString::new(new_path) {
+                                // Remove existing PATH from env_c, then add our modified one
+                                env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
+                                env_c.push(cstr);
+                            }
+                            let browser_cmd = format!("BROWSER={}", shim.launcher.display());
+                            if let Ok(cstr) = CString::new(browser_cmd) {
+                                env_c.push(cstr);
+                            }
+                            browser_shim = Some(shim);
                         }
-                        let quoted_helper = shell_quote(&shim.helper_exe.display().to_string());
-                        let browser_cmd = format!("BROWSER={quoted_helper} open-url-helper");
-                        if let Ok(cstr) = CString::new(browser_cmd) {
-                            env_c.push(cstr);
-                        }
-                        open_shim = Some(shim);
                     }
                 }
             }
         }
     }
 
-    #[cfg(target_os = "macos")]
-    let _keep_open_shim_alive = open_shim;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let _keep_browser_shim_alive = browser_shim;
 
     // Create null-terminated pointer arrays for execve
     let argv_ptrs: Vec<*const libc::c_char> = argv_c
@@ -492,23 +644,14 @@ pub fn execute_supervised(
         }
     }
 
-    // NOTE: In supervised mode with IPC, we do NOT set
-    // PR_SET_DUMPABLE(0) before fork. The child must remain dumpable so
-    // the parent can read /proc/CHILD/mem for seccomp-notify path extraction.
-    // In rollback-only mode (no IPC), the child is made non-dumpable after
-    // sandbox apply (see child branch below).
-    // The parent sets itself non-dumpable immediately after fork.
+    // NOTE: We do not set PR_SET_DUMPABLE(0) before fork because the parent may
+    // need to inspect the child's memory for seccomp-notify requests. Instead,
+    // the parent hardens itself immediately after fork and the child hardens
+    // itself after sandbox/filter setup whenever procfs inspection is not
+    // required.
 
-    // Create PTY pair for terminal isolation, only when capability elevation
-    // is enabled. The PTY gives the child its own terminal so TUI apps can set
-    // raw mode without affecting the supervisor's approval prompts.
-    // Without elevation there are no prompts, so the child inherits the parent's
-    // terminal directly (simpler, avoids PTY relay complexity).
-    let pty_pair = if config.capability_elevation {
-        Some(pty_mux::create_pty_pair()?)
-    } else {
-        None
-    };
+    // PTY pair is prepared by the caller so sessions can be detached and
+    // reattached independently of capability elevation.
     let pty_slave_fd = pty_pair.as_ref().map(|p| p.slave.as_raw_fd());
 
     // Compute child's FD keep list: PTY slave (if elevation) + supervisor socket fd
@@ -520,7 +663,27 @@ pub fn execute_supervised(
         child_keep_fds.push(fd);
     }
 
-    let effective_caps: &CapabilitySet = config.caps;
+    // When the proxy filter will be installed, use a pipe to hand off the notify fd
+    // from child to parent. The proxy filter intercepts sendmsg, so SCM_RIGHTS
+    // transfer would deadlock. The child writes the raw fd number; the parent uses
+    // pidfd_getfd to duplicate it without sendmsg.
+    #[cfg(target_os = "linux")]
+    let proxy_fd_pipe: Option<[i32; 2]> = if config.seccomp_proxy_fallback {
+        let mut fds = [0_i32; 2];
+        // SAFETY: pipe2 with a valid array pointer is safe.
+        let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        if ret != 0 {
+            return Err(NonoError::SandboxInit(format!(
+                "pipe2 for proxy fd transfer failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // Child keeps the write end; keep it out of close_inherited_fds.
+        child_keep_fds.push(fds[1]);
+        Some(fds)
+    } else {
+        None
+    };
 
     // Compute max FD in parent (get_max_fd may allocate on Linux)
     let max_fd = get_max_fd();
@@ -535,6 +698,27 @@ pub fn execute_supervised(
 
     match fork_result {
         Ok(ForkResult::Child) => {
+            #[cfg(target_os = "linux")]
+            let mut child_caps = config.caps.clone();
+            #[cfg(target_os = "linux")]
+            child_caps.remap_procfs_self_references(std::process::id(), None);
+            #[cfg(target_os = "linux")]
+            child_caps.widen_procfs_self_to_proc();
+            #[cfg(target_os = "linux")]
+            let effective_caps: &CapabilitySet = &child_caps;
+
+            #[cfg(target_os = "macos")]
+            let mut child_caps = config.caps.clone();
+            #[cfg(target_os = "macos")]
+            if supervisor.is_some() {
+                child_caps.set_seatbelt_debug_deny(true);
+            }
+            #[cfg(target_os = "macos")]
+            let effective_caps: &CapabilitySet = &child_caps;
+
+            #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+            let effective_caps: &CapabilitySet = config.caps;
+
             // CHILD: Set up PTY, apply sandbox, then exec.
             //
             // The child applies the sandbox itself before exec.
@@ -569,7 +753,7 @@ pub fn execute_supervised(
             // change terminal modes without affecting the supervisor.
             // SAFETY: We are in the child after fork, slave_fd is valid.
             if let Some(slave_fd) = pty_slave_fd {
-                unsafe { pty_mux::setup_child_pty(slave_fd) };
+                unsafe { crate::pty_proxy::setup_child_pty(slave_fd) };
             }
 
             // Apply Landlock FIRST. Landlock's restrict_self() opens path fds
@@ -616,36 +800,49 @@ pub fn execute_supervised(
             // On Linux with capability elevation: install seccomp-notify filter
             // AFTER Landlock. The kernel evaluates seccomp before LSM hooks
             // regardless of installation order, so the security properties are
-            // identical. All openat/openat2 from exec'd child are routed to
-            // the supervisor, which can inject fds for approved paths.
-            // Without elevation, seccomp is not installed — the child runs
-            // with static Landlock capabilities only.
+            // identical. All openat/openat2 from exec'd child are routed to the
+            // supervisor, which can inject fds for approved paths.
+            // Without elevation, seccomp is not installed — the child runs with
+            // static Landlock capabilities only.
+            // Unix socket deny is handled by the proxy filter (when active),
+            // not by this notify filter.
+            //
+            // On WSL2, seccomp user notification returns EBUSY because WSL2's
+            // init already claims the notify listener. The main.rs guards should
+            // have disabled these flags, but we check again as defense in depth.
             #[cfg(target_os = "linux")]
             {
-                if config.capability_elevation {
+                if config.capability_elevation && nono::sandbox::is_wsl2() {
+                    let msg = b"nono: WSL2 detected, skipping seccomp-notify (capability elevation unavailable)\n";
+                    unsafe {
+                        libc::write(
+                            libc::STDERR_FILENO,
+                            msg.as_ptr().cast::<libc::c_void>(),
+                            msg.len(),
+                        );
+                    }
+                } else if config.capability_elevation {
                     if let Some(fd) = child_sock_fd {
                         match nono::sandbox::install_seccomp_notify() {
                             Ok(notify_fd) => {
-                                // Send the notify fd to the parent via SCM_RIGHTS
-                                // SAFETY: We own the child socket end and the notify fd
-                                // is valid. from_stream is safe with our inherited fd.
-                                let child_sock =
-                                    unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-                                let tmp_sock = SupervisorSocket::from_stream(child_sock);
-                                if let Err(_e) = tmp_sock.send_fd(notify_fd.as_raw_fd()) {
-                                    let msg =
-                                        b"nono: failed to send seccomp notify fd to supervisor\n";
+                                if let Err(e) = nono::supervisor::socket::send_fd_via_socket(
+                                    fd,
+                                    notify_fd.as_raw_fd(),
+                                ) {
+                                    let detail = format!(
+                                        "nono: failed to send seccomp notify fd to supervisor: {}\n",
+                                        e
+                                    );
+                                    let msg = detail.as_bytes();
                                     unsafe {
                                         libc::write(
                                             libc::STDERR_FILENO,
                                             msg.as_ptr().cast::<libc::c_void>(),
                                             msg.len(),
                                         );
+                                        libc::_exit(126);
                                     }
                                 }
-                                // Leak the socket wrapper so it doesn't close the fd
-                                // (the fd is still needed for supervisor IPC)
-                                std::mem::forget(tmp_sock);
                             }
                             Err(e) => {
                                 // seccomp not available -- proceed without transparent expansion
@@ -668,24 +865,44 @@ pub fn execute_supervised(
 
                 // If the parent determined that seccomp proxy fallback is needed
                 // (Landlock ABI lacks AccessNet + ProxyOnly mode), install the
-                // proxy filter and send its notify fd to the parent.
-                if config.seccomp_proxy_fallback {
+                // proxy filter and write its notify fd number to the pipe.
+                // sendmsg is intercepted by the filter when has_denied_sockets=true,
+                // so SCM_RIGHTS transfer would deadlock. Writing a plain i32 via
+                // write() is safe — write() is not intercepted by the proxy filter.
+                // On WSL2 this flag should already be false (guarded in main.rs),
+                // but check again to avoid EBUSY / _exit(126).
+                if config.seccomp_proxy_fallback && nono::sandbox::is_wsl2() {
+                    let msg = b"nono: WSL2 detected, skipping seccomp proxy filter (proxy network filtering unavailable)\n";
+                    unsafe {
+                        libc::write(
+                            libc::STDERR_FILENO,
+                            msg.as_ptr().cast::<libc::c_void>(),
+                            msg.len(),
+                        );
+                    }
+                } else if config.seccomp_proxy_fallback {
                     let has_bind = match effective_caps.network_mode() {
                         nono::NetworkMode::ProxyOnly { bind_ports, .. } => !bind_ports.is_empty(),
                         _ => false,
                     };
-                    if let Some(fd) = child_sock_fd {
-                        match nono::sandbox::install_seccomp_proxy_filter(has_bind) {
+                    let has_denied_sockets = !config.denied_socket_paths.is_empty();
+                    if let Some(pipe_fds) = proxy_fd_pipe {
+                        match nono::sandbox::install_seccomp_proxy_filter(
+                            has_bind,
+                            has_denied_sockets,
+                        ) {
                             Ok(proxy_notify_fd) => {
-                                let child_sock =
-                                    unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-                                let tmp_sock = SupervisorSocket::from_stream(child_sock);
-                                if let Err(e) = tmp_sock.send_fd(proxy_notify_fd.as_raw_fd()) {
-                                    let detail = format!(
-                                        "nono: failed to send proxy seccomp notify fd: {}\n",
-                                        e
-                                    );
-                                    let msg = detail.as_bytes();
+                                let raw_fd: i32 = proxy_notify_fd.as_raw_fd();
+                                // SAFETY: pipe_fds[1] is the write end of a valid pipe.
+                                let n = unsafe {
+                                    libc::write(
+                                        pipe_fds[1],
+                                        (&raw_fd as *const i32).cast::<libc::c_void>(),
+                                        std::mem::size_of::<i32>(),
+                                    )
+                                };
+                                if n != std::mem::size_of::<i32>() as isize {
+                                    let msg = b"nono: failed to write proxy notify fd to pipe\n";
                                     unsafe {
                                         libc::write(
                                             libc::STDERR_FILENO,
@@ -695,7 +912,15 @@ pub fn execute_supervised(
                                         libc::_exit(126);
                                     }
                                 }
-                                std::mem::forget(tmp_sock);
+                                // Close write end; parent reads then uses pidfd_getfd to dup.
+                                unsafe { libc::close(pipe_fds[1]) };
+                                // Keep the notify fd alive until exec — parent holds a dup.
+                                // Must add to child_keep_fds: Landlock's restrict_self() opens
+                                // and closes many path fds, freeing slots ≤ max_fd. The proxy
+                                // notify fd may reuse one of those freed slots and would
+                                // otherwise be closed by close_inherited_fds.
+                                child_keep_fds.push(raw_fd);
+                                std::mem::forget(proxy_notify_fd);
                             }
                             Err(e) => {
                                 let detail =
@@ -713,19 +938,27 @@ pub fn execute_supervised(
                         }
                     }
                 }
-            }
 
-            // When capability elevation is off AND no seccomp proxy fallback
-            // is active, make the child non-dumpable to prevent ptrace
-            // attachment from same-UID processes. When either is active,
-            // the child must stay dumpable so the parent can read
-            // /proc/CHILD/mem for seccomp-notify path/sockaddr extraction.
-            #[cfg(target_os = "linux")]
-            {
-                if !config.capability_elevation && !config.seccomp_proxy_fallback {
-                    // No supervisor needs /proc/CHILD/mem — safe to drop dumpable
-                    unsafe {
-                        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+                if !linux_child_requires_dumpable(
+                    config.capability_elevation,
+                    config.seccomp_proxy_fallback,
+                ) {
+                    use nix::sys::prctl;
+
+                    if let Err(e) = prctl::set_dumpable(false) {
+                        let detail = format!(
+                            "nono: failed to set PR_SET_DUMPABLE(0) in supervised child: {}\n",
+                            e
+                        );
+                        let msg = detail.as_bytes();
+                        unsafe {
+                            libc::write(
+                                libc::STDERR_FILENO,
+                                msg.as_ptr().cast::<libc::c_void>(),
+                                msg.len(),
+                            );
+                            libc::_exit(126);
+                        }
                     }
                 }
             }
@@ -767,13 +1000,37 @@ pub fn execute_supervised(
             unsafe { libc::_exit(127) }
         }
         Ok(ForkResult::Parent { child }) => {
-            // Close the PTY slave in the parent (only the child uses it).
-            // The master stays open for relay. Destructure to take ownership
-            // of master and drop slave.
-            let pty_master = pty_pair.map(|p| {
-                drop(p.slave);
-                p.master
-            });
+            if let Some(callback) = on_fork {
+                callback(child.as_raw() as u32);
+            }
+
+            let mut pty_proxy = if let Some(pty) = pty_pair {
+                drop(pty.slave);
+                let session_id = pty_session_id
+                    .or_else(|| supervisor.map(|s| s.session_id))
+                    .unwrap_or("unknown");
+                let attach_initial_client =
+                    supervisor.map(|s| s.attach_initial_client).unwrap_or(true);
+                let detach_sequence = supervisor.and_then(|s| s.detach_sequence);
+                match crate::pty_proxy::PtyProxy::new(
+                    pty.master,
+                    session_id,
+                    attach_initial_client,
+                    detach_sequence,
+                ) {
+                    Ok(proxy) => Some(proxy),
+                    Err(e) => {
+                        let _ = signal::kill(child, Signal::SIGKILL);
+                        let _ = waitpid(child, None);
+                        return Err(NonoError::SandboxInit(format!(
+                            "Failed to create PTY proxy: {}",
+                            e
+                        )));
+                    }
+                }
+            } else {
+                None
+            };
 
             // Destructure socket pair: close child's end, keep supervisor's end
             let supervisor_sock = if let Some((sup, child_end)) = socket_pair {
@@ -789,7 +1046,7 @@ pub fn execute_supervised(
 
             // On Linux, set PR_SET_DUMPABLE(0) on the parent to prevent
             // ptrace attachment. The child stays dumpable only when
-            // supervisor IPC is active (for /proc/CHILD/mem path extraction).
+            // seccomp-driven procfs inspection is active.
             #[cfg(target_os = "linux")]
             {
                 use nix::sys::prctl;
@@ -847,20 +1104,48 @@ pub fn execute_supervised(
             };
 
             // On Linux: if the parent determined seccomp proxy fallback is needed,
-            // receive the proxy notify fd from the child. Only attempt recv when
-            // we know the child will send it (both sides use the same flag).
+            // read the child's notify fd number from the pipe, then use
+            // pidfd_open + pidfd_getfd to duplicate it into the parent.
+            // This avoids sendmsg/SCM_RIGHTS, which the proxy filter intercepts
+            // when has_denied_sockets=true (causing a deadlock with the old approach).
             #[cfg(target_os = "linux")]
             let proxy_notify_fd: Option<OwnedFd> = if config.seccomp_proxy_fallback {
-                if let Some(ref sup_sock) = supervisor_sock {
-                    match sup_sock.recv_fd() {
-                        Ok(fd) => {
-                            debug!("Received proxy seccomp notify fd from child");
-                            Some(fd)
+                if let Some(pipe_fds) = proxy_fd_pipe {
+                    // Close write end in parent — child owns it.
+                    unsafe { libc::close(pipe_fds[1]) };
+                    let mut raw_fd_buf = [0i32; 1];
+                    // SAFETY: pipe_fds[0] is the read end of a valid pipe.
+                    let n = unsafe {
+                        libc::read(
+                            pipe_fds[0],
+                            raw_fd_buf.as_mut_ptr().cast::<libc::c_void>(),
+                            std::mem::size_of::<i32>(),
+                        )
+                    };
+                    unsafe { libc::close(pipe_fds[0]) };
+                    if n == std::mem::size_of::<i32>() as isize {
+                        let child_fd = raw_fd_buf[0];
+                        match nono::sandbox::pidfd_open(child.as_raw() as u32) {
+                            Ok(pidfd) => {
+                                match nono::sandbox::pidfd_getfd(pidfd.as_raw_fd(), child_fd) {
+                                    Ok(fd) => {
+                                        debug!("Received proxy seccomp notify fd from child via pidfd_getfd");
+                                        Some(fd)
+                                    }
+                                    Err(e) => {
+                                        warn!("pidfd_getfd for proxy notify fd failed: {}", e);
+                                        None
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("pidfd_open for proxy notify fd failed: {}", e);
+                                None
+                            }
                         }
-                        Err(e) => {
-                            warn!("Failed to receive proxy seccomp notify fd: {}", e);
-                            None
-                        }
+                    } else {
+                        warn!("Failed to read proxy notify fd from pipe");
+                        None
                     }
                 } else {
                     None
@@ -870,29 +1155,8 @@ pub fn execute_supervised(
             };
 
             // Set up signal forwarding.
-            setup_signal_forwarding(child);
+            setup_signal_forwarding(child, pty_proxy.as_ref().map(|p| p.poll_fds().0));
             let _signal_forwarding_guard = SignalForwardingGuard;
-
-            // Set up PTY relay when capability elevation is enabled.
-            // The real terminal is put into raw mode so keystrokes pass through
-            // to the child transparently. When the supervisor needs to prompt,
-            // it restores the terminal, prompts, then re-enters raw mode.
-            // Without elevation, the child inherits the parent's terminal directly.
-            let real_term = if pty_master.is_some() {
-                Some(pty_mux::RealTerminal::open()?)
-            } else {
-                None
-            };
-            let pty_master_fd = pty_master.as_ref().map(|m| m.as_raw_fd());
-            let real_tty_fd = real_term.as_ref().map(|t| t.as_raw_fd());
-
-            if let (Some(master_fd), Some(tty_fd)) = (pty_master_fd, real_tty_fd) {
-                pty_mux::set_nonblocking(master_fd)?;
-                pty_mux::setup_sigwinch_forwarding(tty_fd, master_fd);
-                if let Some(ref rt) = real_term {
-                    rt.enter_raw_mode()?;
-                }
-            }
 
             // NOTE: peer_pid() is NOT called here. For socketpair() created
             // before fork, LOCAL_PEERPID/SO_PEERCRED return the parent's own PID
@@ -901,35 +1165,32 @@ pub fn execute_supervised(
             // only our forked child has the other end. peer_pid() is useful for
             // named sockets (bind/connect), not socketpair+fork.
 
+            #[cfg(target_os = "macos")]
+            let sandbox_log_collector = if supervisor.is_some() {
+                crate::sandbox_log::SandboxLogCollector::start(child.as_raw())
+            } else {
+                None
+            };
+
             // Build initial-set path lookup for seccomp fast-path (Linux)
             // Stores (resolved_path, is_file) to distinguish file vs directory semantics:
             // - File capabilities: exact match only (no subpath access)
             // - Directory capabilities: subpath access allowed via starts_with
             #[cfg(target_os = "linux")]
-            let initial_caps: Vec<(std::path::PathBuf, bool)> = config
-                .caps
-                .fs_capabilities()
-                .iter()
-                .map(|cap| (cap.resolved.clone(), cap.is_file))
-                .collect();
-
-            // Build optional PTY relay (only when capability elevation allocates a PTY).
-            let relay = if let (Some(mfd), Some(tfd), Some(ref rt)) =
-                (pty_master_fd, real_tty_fd, &real_term)
-            {
-                Some(PtyRelay {
-                    master_fd: mfd,
-                    real_tty_fd: tfd,
-                    real_term: rt,
-                })
-            } else {
-                None
+            let initial_caps: Vec<supervisor_linux::InitialCapability> = {
+                let mut supervisor_caps = config.caps.clone();
+                supervisor_caps.remap_procfs_self_references(child.as_raw() as u32, None);
+                supervisor_caps
+                    .fs_capabilities()
+                    .iter()
+                    .map(|cap| supervisor_linux::InitialCapability {
+                        path: cap.resolved.clone(),
+                        access: cap.access,
+                        is_file: cap.is_file,
+                    })
+                    .collect()
             };
 
-            // Run supervisor IPC loop when configured, with or without PTY relay.
-            // Trust interception runs over the IPC socket regardless of
-            // capability_elevation. The PTY relay is only present when
-            // elevation is active (seccomp-notify + interactive prompts).
             let (status, denials) =
                 if let (Some(sup_cfg), Some(mut sup_sock)) = (supervisor, supervisor_sock) {
                     #[cfg(target_os = "linux")]
@@ -938,11 +1199,12 @@ pub fn execute_supervised(
                             child,
                             &mut sup_sock,
                             sup_cfg,
+                            config.startup_timeout,
                             seccomp_notify_fd.as_ref(),
                             proxy_notify_fd.as_ref(),
                             &initial_caps,
                             trust_interceptor,
-                            relay.as_ref(),
+                            pty_proxy.as_mut(),
                         )?
                     }
                     #[cfg(not(target_os = "linux"))]
@@ -951,37 +1213,41 @@ pub fn execute_supervised(
                             child,
                             &mut sup_sock,
                             sup_cfg,
+                            config.startup_timeout,
                             trust_interceptor,
-                            relay.as_ref(),
+                            pty_proxy.as_mut(),
                         )?
                     }
-                } else if let Some(ref r) = relay {
-                    // PTY relay active but no supervisor — just relay I/O.
-                    let status = wait_for_child_with_relay(child, r)?;
-                    (status, Vec::new())
                 } else {
-                    // No supervisor, no PTY — simple wait.
-                    let status = wait_for_child(child)?;
+                    let status =
+                        wait_for_child_with_pty(child, pty_proxy.as_mut(), config.startup_timeout)?;
                     (status, Vec::new())
                 };
 
-            // Restore real terminal and clean up PTY state
-            if real_term.is_some() {
-                pty_mux::clear_sigwinch_forwarding();
+            // Close the attach listener immediately so no new attach
+            // connections can sneak in during teardown.  Without this,
+            // the kernel keeps accepting connections into the listen
+            // backlog even though nobody is calling accept(), and the
+            // attaching client gets EPIPE ("Broken pipe") when it
+            // tries to send the handshake.
+            if let Some(ref mut p) = pty_proxy {
+                p.shutdown_attach_listener();
             }
-            if let Some(ref rt) = real_term {
-                let _ = rt.restore();
-            }
-            // Drop PTY master to send EOF to child (if still alive)
-            drop(pty_master);
 
             let exit_code = match status {
                 WaitStatus::Exited(_, code) => {
                     debug!("Supervised child exited with code {}", code);
+                    let by_signal = (129..=143).contains(&code);
+                    if by_signal && !config.no_diagnostics {
+                        print_terminal_safe_stderr("[nono] Session stopped.");
+                    }
                     code
                 }
                 WaitStatus::Signaled(_, sig, _) => {
                     debug!("Supervised child killed by signal {}", sig);
+                    if !config.no_diagnostics {
+                        print_terminal_safe_stderr("[nono] Session stopped.");
+                    }
                     128 + sig as i32
                 }
                 other => {
@@ -990,25 +1256,57 @@ pub fn execute_supervised(
                 }
             };
 
-            // Print diagnostic footer on non-zero exit.
-            if exit_code != 0 && !config.no_diagnostics {
-                let mode = if supervisor.is_some() {
-                    DiagnosticMode::Supervised
+            // Analyze PTY screen content for sandbox-related errors.
+            let error_observation = pty_proxy
+                .as_ref()
+                .map(|p| {
+                    nono::diagnostic::analyze_error_output(
+                        &p.screen_plaintext(),
+                        config.protected_paths,
+                        Some(config.current_dir),
+                    )
+                })
+                .unwrap_or_default();
+
+            let mode = if supervisor.is_some() {
+                DiagnosticMode::Supervised
+            } else {
+                DiagnosticMode::Standard
+            };
+
+            let should_print_diagnostics = !config.no_diagnostics
+                && (exit_code != 0 || !denials.is_empty() || error_observation.has_findings());
+
+            // Print diagnostic footer on non-zero exit or when the PTY
+            // output shows a likely sandbox-related issue.
+            if should_print_diagnostics {
+                #[cfg(target_os = "macos")]
+                let sandbox_violations = if supervisor.is_some() {
+                    sandbox_log_collector
+                        .map(crate::sandbox_log::SandboxLogCollector::finish)
+                        .unwrap_or_default()
                 } else {
-                    DiagnosticMode::Standard
+                    Vec::new()
                 };
+                #[cfg(not(target_os = "macos"))]
+                let sandbox_violations = Vec::new();
+
                 let mut formatter = DiagnosticFormatter::new(config.caps)
                     .with_mode(mode)
                     .with_denials(&denials)
-                    .with_protected_paths(config.protected_paths);
+                    .with_sandbox_violations(&sandbox_violations)
+                    .with_protected_paths(config.protected_paths)
+                    .with_error_observation(error_observation)
+                    .with_current_dir(config.current_dir);
                 if let Some(program) = config.command.first() {
                     formatter = formatter.with_command(nono::diagnostic::CommandContext {
                         program: program.clone(),
                         resolved_path: config.resolved_program.to_path_buf(),
+                        args: config.command.to_vec(),
                     });
                 }
                 let footer = formatter.format_footer(exit_code);
-                eprintln!("\n{}", footer);
+                crate::output::print_diagnostic_footer(&footer);
             }
 
             Ok(exit_code)
@@ -1050,51 +1348,133 @@ fn get_max_fd() -> i32 {
     }
 }
 
-/// Wait for child process while relaying PTY I/O.
-///
-/// Used when no supervisor IPC is configured but we still need to relay
-/// the PTY for terminal isolation.
-fn wait_for_child_with_relay(child: Pid, relay: &PtyRelay<'_>) -> Result<WaitStatus> {
+/// Wait for child process while proxying PTY I/O.
+fn wait_for_child_with_pty(
+    child: Pid,
+    pty: Option<&mut crate::pty_proxy::PtyProxy>,
+    startup_timeout: Option<StartupTimeoutConfig<'_>>,
+) -> Result<WaitStatus> {
+    let pty = match pty {
+        Some(pty) => pty,
+        None => return wait_for_child_with_startup_timeout(child, startup_timeout),
+    };
+    let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
+    let mut startup_prompted = false;
+
     loop {
-        // Poll: real_tty (user input) + pty_master (child output)
+        let (master_fd, client_fd, attach_fd, resize_fd) = pty.poll_fds();
         let mut pfds = [
             libc::pollfd {
-                fd: relay.real_tty_fd,
+                fd: master_fd,
                 events: libc::POLLIN,
                 revents: 0,
             },
             libc::pollfd {
-                fd: relay.master_fd,
+                fd: client_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: attach_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: resize_fd,
                 events: libc::POLLIN,
                 revents: 0,
             },
         ];
 
-        // SAFETY: pfds is a valid array on the stack
-        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 200) };
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 4, 200) };
 
         if ret > 0 {
-            // User input -> PTY master (child's stdin)
-            if pfds[0].revents & libc::POLLIN != 0 {
-                pty_mux::relay_bytes(relay.real_tty_fd, relay.master_fd);
+            if !handle_pty_poll_events(
+                pty,
+                pfds[0].revents,
+                pfds[1].revents,
+                pfds[2].revents,
+                pfds[3].revents,
+                "PTY wait loop",
+            ) {
+                break;
             }
-            // Child output -> real terminal
-            if pfds[1].revents & libc::POLLIN != 0 {
-                pty_mux::relay_bytes(relay.master_fd, relay.real_tty_fd);
+        } else if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                warn!("poll() error in PTY wait loop: {}", err);
+                break;
             }
         }
 
+        let pause_requested = drain_pause_pipe();
+        if pause_requested {
+            pty.sync_current_terminal_winsize();
+        }
+        let in_band_detach_requested = pty.take_detach_request();
+        handle_pty_detach_request(Some(pty), pause_requested, in_band_detach_requested);
+
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) => continue,
-            Ok(status) => {
-                // Drain any remaining output from PTY master
-                loop {
-                    if pty_mux::relay_bytes(relay.master_fd, relay.real_tty_fd) == 0 {
-                        break;
+            Ok(WaitStatus::StillAlive) => {
+                if let Some((deadline, timeout_cfg)) = startup_deadline {
+                    let has_output = pty.has_observed_output();
+                    if Instant::now() >= deadline && !has_output && !startup_prompted {
+                        startup_prompted = true;
+                        let paused_terminal = pty.pause_terminal_for_prompt();
+                        let terminate = prompt_startup_termination(timeout_cfg, has_output);
+                        if paused_terminal {
+                            pty.resume_terminal_after_prompt();
+                        }
+                        if terminate {
+                            let _ = signal::kill(child, Signal::SIGKILL);
+                            let status = wait_for_child(child)?;
+                            return Ok(status);
+                        }
                     }
                 }
-                return Ok(status);
+                continue;
             }
+            Ok(WaitStatus::Stopped(_, sig)) => {
+                debug!("Child stopped by signal {}, keeping supervisor alive", sig);
+                continue;
+            }
+            Ok(WaitStatus::Continued(_)) => {
+                debug!("Child continued, waiting for terminal exit");
+                continue;
+            }
+            Ok(status) => return Ok(status),
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => {
+                return Err(NonoError::SandboxInit(format!("waitpid() failed: {}", e)));
+            }
+        }
+    }
+
+    wait_for_child(child)
+}
+
+fn wait_for_child_with_startup_timeout(
+    child: Pid,
+    startup_timeout: Option<StartupTimeoutConfig<'_>>,
+) -> Result<WaitStatus> {
+    let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
+    let mut startup_prompted = false;
+
+    loop {
+        match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {
+                if let Some((deadline, timeout_cfg)) = startup_deadline {
+                    if Instant::now() >= deadline && !startup_prompted {
+                        startup_prompted = true;
+                        if prompt_startup_termination(timeout_cfg, true) {
+                            let _ = signal::kill(child, Signal::SIGKILL);
+                            return wait_for_child(child);
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Ok(status) => return Ok(status),
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => {
                 return Err(NonoError::SandboxInit(format!("waitpid() failed: {}", e)));
@@ -1138,7 +1518,7 @@ fn wait_for_child(child: Pid) -> Result<WaitStatus> {
 /// 1. `execute_supervised` is CLI code, not library code (per DESIGN-supervisor.md)
 /// 2. The fork+wait model inherently requires single-threaded execution
 /// 3. Library consumers would use `Sandbox::apply()` directly, not the fork machinery
-fn setup_signal_forwarding(child: Pid) {
+fn setup_signal_forwarding(child: Pid, pty_master_fd: Option<i32>) {
     // ==================== SAFETY INVARIANT ====================
     // This static variable is ONLY safe because execute_supervised()
     // verifies single-threaded execution BEFORE calling this function.
@@ -1157,6 +1537,11 @@ fn setup_signal_forwarding(child: Pid) {
     // - The only safe option is process-global static storage
     // - AtomicI32 ensures atomic reads/writes
     CHILD_PID.store(child.as_raw(), std::sync::atomic::Ordering::SeqCst);
+    PTY_MASTER_FD.store(
+        pty_master_fd.unwrap_or(-1),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    create_pause_pipe();
 
     // Install signal handlers for common signals
     // SAFETY: signal handlers are async-signal-safe (only call kill())
@@ -1166,29 +1551,149 @@ fn setup_signal_forwarding(child: Pid) {
             Signal::SIGTERM,
             Signal::SIGHUP,
             Signal::SIGQUIT,
+            Signal::SIGUSR1,
         ] {
             if let Err(e) = signal::signal(*sig, signal::SigHandler::Handler(forward_signal)) {
                 debug!("Failed to install handler for {:?}: {}", sig, e);
+            }
+        }
+
+        if pty_master_fd.is_some() {
+            if let Err(e) = signal::signal(
+                Signal::SIGWINCH,
+                signal::SigHandler::Handler(forward_signal),
+            ) {
+                debug!("Failed to install SIGWINCH handler: {:?}", e);
             }
         }
     }
 }
 
 static CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static PTY_MASTER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static PAUSE_PIPE_WRITE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static PAUSE_PIPE_READ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+fn create_pause_pipe() -> i32 {
+    let mut fds = [0i32; 2];
+    let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if ret != 0 {
+        return -1;
+    }
+    unsafe {
+        libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK);
+        libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
+        libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    PAUSE_PIPE_READ.store(fds[0], std::sync::atomic::Ordering::SeqCst);
+    PAUSE_PIPE_WRITE.store(fds[1], std::sync::atomic::Ordering::SeqCst);
+    fds[0]
+}
+
+fn drain_pause_pipe() -> bool {
+    let read_fd = PAUSE_PIPE_READ.load(std::sync::atomic::Ordering::SeqCst);
+    if read_fd < 0 {
+        return false;
+    }
+    let mut buf = [0u8; 16];
+    let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+    n > 0
+}
+
+fn close_pause_pipe() {
+    let r = PAUSE_PIPE_READ.swap(-1, std::sync::atomic::Ordering::SeqCst);
+    let w = PAUSE_PIPE_WRITE.swap(-1, std::sync::atomic::Ordering::SeqCst);
+    if r >= 0 {
+        unsafe { libc::close(r) };
+    }
+    if w >= 0 {
+        unsafe { libc::close(w) };
+    }
+}
 
 extern "C" fn forward_signal(sig: libc::c_int) {
     let child_raw = CHILD_PID.load(std::sync::atomic::Ordering::SeqCst);
     if child_raw > 0 {
-        // Forward signal to child
-        // SAFETY: kill() is async-signal-safe
-        unsafe {
-            libc::kill(child_raw, sig);
+        if sig == libc::SIGWINCH {
+            let master_fd = PTY_MASTER_FD.load(std::sync::atomic::Ordering::SeqCst);
+            if master_fd >= 0 {
+                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+                unsafe {
+                    if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
+                        libc::ioctl(master_fd, libc::TIOCSWINSZ as libc::c_ulong, &ws);
+                    }
+                }
+            }
+        } else if sig == libc::SIGUSR1 {
+            let wfd = PAUSE_PIPE_WRITE.load(std::sync::atomic::Ordering::SeqCst);
+            if wfd >= 0 {
+                unsafe {
+                    libc::write(wfd, b"P".as_ptr().cast(), 1);
+                }
+            }
+        } else {
+            unsafe {
+                libc::kill(child_raw, sig);
+            }
         }
     }
 }
 
 fn clear_signal_forwarding_target() {
     CHILD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+    PTY_MASTER_FD.store(-1, std::sync::atomic::Ordering::SeqCst);
+    close_pause_pipe();
+}
+
+fn detach_client_for_session(pty: &mut crate::pty_proxy::PtyProxy) -> bool {
+    pty.detach()
+}
+
+fn restore_terminal_after_detach() {
+    crate::pty_proxy::write_detach_terminal_reset(libc::STDOUT_FILENO);
+    crate::pty_proxy::write_detach_notice(libc::STDERR_FILENO);
+}
+
+fn handle_pty_poll_events(
+    pty: &mut crate::pty_proxy::PtyProxy,
+    master_revents: libc::c_short,
+    client_revents: libc::c_short,
+    attach_revents: libc::c_short,
+    resize_revents: libc::c_short,
+    loop_name: &str,
+) -> bool {
+    if master_revents & libc::POLLIN != 0 && !pty.proxy_master_to_client() {
+        debug!("Stopping {loop_name} after PTY master relay failure");
+        return false;
+    }
+    if client_revents & libc::POLLIN != 0 && !pty.proxy_client_to_master() {
+        debug!("Stopping {loop_name} after PTY client relay failure");
+        return false;
+    }
+    if attach_revents & libc::POLLIN != 0 {
+        pty.try_accept();
+    }
+    if resize_revents & libc::POLLIN != 0 {
+        pty.apply_resize_update();
+    }
+    true
+}
+
+fn handle_pty_detach_request(
+    pty: Option<&mut crate::pty_proxy::PtyProxy>,
+    pause_requested: bool,
+    in_band_detach_requested: bool,
+) {
+    if pause_requested {
+        info!("PTY detach requested via SIGUSR1 control signal");
+    }
+    if in_band_detach_requested {
+        info!("PTY detach requested via in-band key sequence");
+    }
+    if (pause_requested || in_band_detach_requested) && pty.is_some_and(detach_client_for_session) {
+        restore_terminal_after_detach();
+    }
 }
 
 struct SignalForwardingGuard;
@@ -1267,20 +1772,19 @@ fn run_supervisor_loop(
     child: Pid,
     sock: &mut SupervisorSocket,
     config: &SupervisorConfig<'_>,
+    startup_timeout: Option<StartupTimeoutConfig<'_>>,
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
-    relay: Option<&PtyRelay<'_>>,
+    mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
 ) -> Result<(WaitStatus, Vec<DenialRecord>)> {
-    let _ = config.session_id;
     let sock_fd = sock.as_raw_fd();
     let mut denials = Vec::new();
     let mut seen_request_ids = HashSet::new();
-
-    // PTY relay fds: -1 when no relay (supervisor-only mode, no PTY mux)
-    let relay_tty_fd = relay.map_or(-1, |r| r.real_tty_fd);
-    let relay_master_fd = relay.map_or(-1, |r| r.master_fd);
+    let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
+    let mut startup_prompted = false;
 
     loop {
-        // Poll: [0] supervisor socket, [1] real_tty (user input), [2] pty_master (child output)
+        let (pty_master, pty_client, pty_attach, pty_resize) =
+            pty.as_ref().map_or((-1, -1, -1, -1), |p| p.poll_fds());
         let mut pfds = [
             libc::pollfd {
                 fd: sock_fd,
@@ -1288,31 +1792,35 @@ fn run_supervisor_loop(
                 revents: 0,
             },
             libc::pollfd {
-                fd: relay_tty_fd,
+                fd: pty_master,
                 events: libc::POLLIN,
                 revents: 0,
             },
             libc::pollfd {
-                fd: relay_master_fd,
+                fd: pty_client,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pty_attach,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pty_resize,
                 events: libc::POLLIN,
                 revents: 0,
             },
         ];
 
-        // SAFETY: pfds is a valid array on the stack
-        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 3, 200) };
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 5, 200) };
 
         if ret > 0 {
-            // Supervisor socket
             if pfds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
                 debug!("Supervisor socket closed by child");
                 break;
             }
             if pfds[0].revents & libc::POLLIN != 0 {
-                // Pause relay if active: restore terminal for interactive prompt
-                if let Some(r) = relay {
-                    let _ = r.real_term.restore();
-                }
                 match sock.recv_message() {
                     Ok(msg) => {
                         if let Err(e) = handle_supervisor_message(
@@ -1332,19 +1840,19 @@ fn run_supervisor_loop(
                         break;
                     }
                 }
-                // Resume relay if active: re-enter raw mode
-                if let Some(r) = relay {
-                    let _ = r.real_term.enter_raw_mode();
-                }
             }
 
-            // PTY relay: user input -> child
-            if relay.is_some() && pfds[1].revents & libc::POLLIN != 0 {
-                pty_mux::relay_bytes(relay_tty_fd, relay_master_fd);
-            }
-            // PTY relay: child output -> user
-            if relay.is_some() && pfds[2].revents & libc::POLLIN != 0 {
-                pty_mux::relay_bytes(relay_master_fd, relay_tty_fd);
+            if let Some(ref mut p) = pty {
+                if !handle_pty_poll_events(
+                    p,
+                    pfds[1].revents,
+                    pfds[2].revents,
+                    pfds[3].revents,
+                    pfds[4].revents,
+                    "supervisor loop",
+                ) {
+                    break;
+                }
             }
         } else if ret < 0 {
             let err = std::io::Error::last_os_error();
@@ -1354,19 +1862,51 @@ fn run_supervisor_loop(
             }
         }
 
+        let pause_requested = drain_pause_pipe();
+        if let Some(ref mut p) = pty {
+            if pause_requested {
+                p.sync_current_terminal_winsize();
+            }
+        }
+        let in_band_detach_requested = pty.as_mut().is_some_and(|p| p.take_detach_request());
+        handle_pty_detach_request(
+            pty.as_deref_mut(),
+            pause_requested,
+            in_band_detach_requested,
+        );
+
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) => continue,
-            Ok(status) => {
-                // Drain remaining child output
-                if relay.is_some() {
-                    loop {
-                        if pty_mux::relay_bytes(relay_master_fd, relay_tty_fd) == 0 {
-                            break;
+            Ok(WaitStatus::StillAlive) => {
+                if let Some((deadline, timeout_cfg)) = startup_deadline {
+                    let has_output = pty.as_ref().is_some_and(|p| p.has_observed_output());
+                    if Instant::now() >= deadline && !has_output && !startup_prompted {
+                        startup_prompted = true;
+                        let paused_terminal = pty
+                            .as_mut()
+                            .is_some_and(|proxy| proxy.pause_terminal_for_prompt());
+                        let terminate = prompt_startup_termination(timeout_cfg, has_output);
+                        if let Some(proxy) = pty.as_mut() {
+                            if paused_terminal {
+                                proxy.resume_terminal_after_prompt();
+                            }
+                        }
+                        if terminate {
+                            let _ = signal::kill(child, Signal::SIGKILL);
+                            return Ok((wait_for_child(child)?, denials));
                         }
                     }
                 }
-                return Ok((status, denials));
+                continue;
             }
+            Ok(WaitStatus::Stopped(_, sig)) => {
+                debug!("Child stopped by signal {}, keeping supervisor alive", sig);
+                continue;
+            }
+            Ok(WaitStatus::Continued(_)) => {
+                debug!("Child continued, keeping supervisor alive");
+                continue;
+            }
+            Ok(status) => return Ok((status, denials)),
             Err(nix::errno::Errno::EINTR) => continue,
             Err(nix::errno::Errno::ECHILD) => {
                 warn!("Child already reaped in supervisor loop");
@@ -1408,11 +1948,12 @@ fn run_supervisor_loop(
     child: Pid,
     sock: &mut SupervisorSocket,
     config: &SupervisorConfig<'_>,
+    startup_timeout: Option<StartupTimeoutConfig<'_>>,
     seccomp_fd: Option<&OwnedFd>,
     proxy_seccomp_fd: Option<&OwnedFd>,
-    initial_caps: &[(std::path::PathBuf, bool)],
+    initial_caps: &[supervisor_linux::InitialCapability],
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
-    relay: Option<&PtyRelay<'_>>,
+    mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
 ) -> Result<(WaitStatus, Vec<DenialRecord>)> {
     let sock_fd = sock.as_raw_fd();
     let notify_raw_fd = seccomp_fd.map(|fd| fd.as_raw_fd());
@@ -1421,55 +1962,64 @@ fn run_supervisor_loop(
     let mut denials = Vec::new();
     let mut seen_request_ids = HashSet::new();
     let mut sock_fd_active = true;
-
-    // PTY relay fds: -1 when no relay (supervisor-only mode, no PTY mux)
-    let relay_tty_fd = relay.map_or(-1, |r| r.real_tty_fd);
-    let relay_master_fd = relay.map_or(-1, |r| r.master_fd);
+    let startup_deadline = startup_timeout.map(|cfg| (Instant::now() + cfg.timeout, cfg));
+    let mut startup_prompted = false;
 
     loop {
-        // Build poll array:
-        // [0] supervisor socket (or -1 if dead)
-        // [1] seccomp notify fd (or -1 if absent)
-        // [2] real_tty (user input for relay, or -1 if no relay)
-        // [3] pty_master (child output for relay, or -1 if no relay)
-        // [4] proxy seccomp notify fd (or -1 if absent)
-        let mut pfds = [
-            libc::pollfd {
-                fd: if sock_fd_active { sock_fd } else { -1 },
+        let mut pfds: Vec<libc::pollfd> = vec![libc::pollfd {
+            fd: if sock_fd_active { sock_fd } else { -1 },
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let notify_idx = notify_raw_fd.map(|nfd| {
+            let idx = pfds.len();
+            pfds.push(libc::pollfd {
+                fd: nfd,
                 events: libc::POLLIN,
                 revents: 0,
-            },
-            libc::pollfd {
-                fd: notify_raw_fd.unwrap_or(-1),
+            });
+            idx
+        });
+        let proxy_notify_idx = proxy_notify_raw_fd.map(|pfd| {
+            let idx = pfds.len();
+            pfds.push(libc::pollfd {
+                fd: pfd,
                 events: libc::POLLIN,
                 revents: 0,
-            },
-            libc::pollfd {
-                fd: relay_tty_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: relay_master_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: proxy_notify_raw_fd.unwrap_or(-1),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
+            });
+            idx
+        });
+        let pty_base_idx = pfds.len();
+        let (pty_master, pty_client, pty_attach, pty_resize) =
+            pty.as_ref().map_or((-1, -1, -1, -1), |p| p.poll_fds());
+        pfds.push(libc::pollfd {
+            fd: pty_master,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        pfds.push(libc::pollfd {
+            fd: pty_client,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        pfds.push(libc::pollfd {
+            fd: pty_attach,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        pfds.push(libc::pollfd {
+            fd: pty_resize,
+            events: libc::POLLIN,
+            revents: 0,
+        });
 
-        // SAFETY: pfds is a valid array on the stack
-        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 5, 200) };
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 200) };
 
         match ret.cmp(&0) {
             std::cmp::Ordering::Greater => {
-                // [0] Supervisor socket
                 if sock_fd_active && pfds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                    if notify_raw_fd.is_some() || proxy_notify_raw_fd.is_some() {
-                        debug!("Supervisor socket closed, continuing for seccomp notifications");
+                    if notify_raw_fd.is_some() || proxy_notify_raw_fd.is_some() || pty.is_some() {
+                        debug!("Supervisor socket closed, continuing for seccomp/proxy/PTY");
                         sock_fd_active = false;
                     } else {
                         debug!("Supervisor socket closed by child");
@@ -1477,10 +2027,6 @@ fn run_supervisor_loop(
                     }
                 }
                 if sock_fd_active && pfds[0].revents & libc::POLLIN != 0 {
-                    // Pause relay if active: restore terminal for interactive prompt
-                    if let Some(r) = relay {
-                        let _ = r.real_term.restore();
-                    }
                     match sock.recv_message() {
                         Ok(msg) => {
                             if let Err(e) = handle_supervisor_message(
@@ -1497,65 +2043,59 @@ fn run_supervisor_loop(
                         }
                         Err(e) => {
                             debug!("Error receiving supervisor message: {}", e);
-                            if notify_raw_fd.is_none() {
-                                if let Some(r) = relay {
-                                    let _ = r.real_term.enter_raw_mode();
-                                }
+                            if notify_raw_fd.is_none()
+                                && proxy_notify_raw_fd.is_none()
+                                && pty.is_none()
+                            {
                                 break;
                             }
                             sock_fd_active = false;
                         }
                     }
-                    // Resume relay if active
-                    if let Some(r) = relay {
-                        let _ = r.real_term.enter_raw_mode();
-                    }
                 }
 
-                // [1] Seccomp notify fd
-                if pfds[1].revents & libc::POLLIN != 0 {
-                    if let Some(nfd) = notify_raw_fd {
-                        if let Some(r) = relay {
-                            if let Err(e) = r.real_term.restore() {
-                                warn!("Failed to restore terminal before seccomp prompt: {}", e);
+                if let Some(notify_idx) = notify_idx {
+                    if pfds[notify_idx].revents & libc::POLLIN != 0 {
+                        if let Some(nfd) = notify_raw_fd {
+                            if let Err(e) = supervisor_linux::handle_seccomp_notification(
+                                nfd,
+                                child,
+                                config,
+                                initial_caps,
+                                &mut rate_limiter,
+                                &mut denials,
+                                trust_interceptor.as_mut(),
+                            ) {
+                                debug!("Error handling seccomp notification: {}", e);
                             }
                         }
-                        if let Err(e) = supervisor_linux::handle_seccomp_notification(
-                            nfd,
-                            child,
-                            config,
-                            initial_caps,
-                            &mut rate_limiter,
-                            &mut denials,
-                            trust_interceptor.as_mut(),
-                        ) {
-                            debug!("Error handling seccomp notification: {}", e);
-                        }
-                        if let Some(r) = relay {
-                            let _ = r.real_term.enter_raw_mode();
+                    }
+                }
+
+                if let Some(proxy_notify_idx) = proxy_notify_idx {
+                    if pfds[proxy_notify_idx].revents & libc::POLLIN != 0 {
+                        if let Some(pfd) = proxy_notify_raw_fd {
+                            if let Err(e) = supervisor_linux::handle_network_notification(
+                                pfd,
+                                config,
+                                &mut rate_limiter,
+                            ) {
+                                debug!("Error handling proxy seccomp notification: {}", e);
+                            }
                         }
                     }
                 }
 
-                // [2] PTY relay: user input -> child
-                if relay.is_some() && pfds[2].revents & libc::POLLIN != 0 {
-                    pty_mux::relay_bytes(relay_tty_fd, relay_master_fd);
-                }
-                // [3] PTY relay: child output -> user
-                if relay.is_some() && pfds[3].revents & libc::POLLIN != 0 {
-                    pty_mux::relay_bytes(relay_master_fd, relay_tty_fd);
-                }
-
-                // [4] Proxy seccomp notify fd (connect/bind interception)
-                if pfds[4].revents & libc::POLLIN != 0 {
-                    if let Some(pfd) = proxy_notify_raw_fd {
-                        if let Err(e) = supervisor_linux::handle_network_notification(
-                            pfd,
-                            config,
-                            &mut rate_limiter,
-                        ) {
-                            debug!("Error handling proxy seccomp notification: {}", e);
-                        }
+                if let Some(ref mut p) = pty {
+                    if !handle_pty_poll_events(
+                        p,
+                        pfds[pty_base_idx].revents,
+                        pfds[pty_base_idx + 1].revents,
+                        pfds[pty_base_idx + 2].revents,
+                        pfds[pty_base_idx + 3].revents,
+                        "supervisor loop",
+                    ) {
+                        break;
                     }
                 }
             }
@@ -1569,19 +2109,51 @@ fn run_supervisor_loop(
             std::cmp::Ordering::Equal => {}
         }
 
+        let pause_requested = drain_pause_pipe();
+        if let Some(ref mut p) = pty {
+            if pause_requested {
+                p.sync_current_terminal_winsize();
+            }
+        }
+        let in_band_detach_requested = pty.as_mut().is_some_and(|p| p.take_detach_request());
+        handle_pty_detach_request(
+            pty.as_deref_mut(),
+            pause_requested,
+            in_band_detach_requested,
+        );
+
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) => continue,
-            Ok(status) => {
-                // Drain remaining child output
-                if relay.is_some() {
-                    loop {
-                        if pty_mux::relay_bytes(relay_master_fd, relay_tty_fd) == 0 {
-                            break;
+            Ok(WaitStatus::StillAlive) => {
+                if let Some((deadline, timeout_cfg)) = startup_deadline {
+                    let has_output = pty.as_ref().is_some_and(|p| p.has_observed_output());
+                    if Instant::now() >= deadline && !has_output && !startup_prompted {
+                        startup_prompted = true;
+                        let paused_terminal = pty
+                            .as_mut()
+                            .is_some_and(|proxy| proxy.pause_terminal_for_prompt());
+                        let terminate = prompt_startup_termination(timeout_cfg, has_output);
+                        if let Some(proxy) = pty.as_mut() {
+                            if paused_terminal {
+                                proxy.resume_terminal_after_prompt();
+                            }
+                        }
+                        if terminate {
+                            let _ = signal::kill(child, Signal::SIGTERM);
+                            return Ok((wait_for_child(child)?, denials));
                         }
                     }
                 }
-                return Ok((status, denials));
+                continue;
             }
+            Ok(WaitStatus::Stopped(_, sig)) => {
+                debug!("Child stopped by signal {}, keeping supervisor alive", sig);
+                continue;
+            }
+            Ok(WaitStatus::Continued(_)) => {
+                debug!("Child continued, keeping supervisor alive");
+                continue;
+            }
+            Ok(status) => return Ok((status, denials)),
             Err(nix::errno::Errno::EINTR) => continue,
             Err(nix::errno::Errno::ECHILD) => {
                 warn!("Child already reaped in supervisor loop");
@@ -1991,14 +2563,57 @@ pub(super) fn record_denial(denials: &mut Vec<DenialRecord>, record: DenialRecor
 /// non-browser `open` invocations (e.g. opening files) still work.
 ///
 /// Returns the path to the shim directory, or `None` on failure.
-#[cfg(target_os = "macos")]
-struct OpenShim {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct BrowserShim {
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     dir: tempfile::TempDir,
-    helper_exe: std::path::PathBuf,
+    launcher: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+fn create_linux_browser_shim(
+    nono_exe: &std::path::Path,
+    supervisor_fd: i32,
+) -> Option<BrowserShim> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let shim_dir = tempfile::Builder::new()
+        .prefix("nono-browser-")
+        .tempdir()
+        .ok()?;
+    let shim_dir_path = shim_dir.path();
+
+    let helper_path = shim_dir_path.join("nono-open-url-helper");
+    if std::fs::copy(nono_exe, &helper_path).is_err() {
+        return None;
+    }
+    if std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o755)).is_err() {
+        return None;
+    }
+
+    let launcher_path = shim_dir_path.join("nono-browser");
+    let quoted_helper = shell_quote(&helper_path.display().to_string());
+    let script = format!(
+        r#"#!/bin/sh
+NONO_SUPERVISOR_FD={supervisor_fd} exec {quoted_helper} open-url-helper "$@"
+"#
+    );
+
+    if std::fs::write(&launcher_path, script).is_err() {
+        return None;
+    }
+    if std::fs::set_permissions(&launcher_path, std::fs::Permissions::from_mode(0o755)).is_err() {
+        return None;
+    }
+
+    Some(BrowserShim {
+        dir: shim_dir,
+        launcher: launcher_path,
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn create_open_shim(nono_exe: &std::path::Path) -> Option<OpenShim> {
+fn create_open_shim(nono_exe: &std::path::Path, supervisor_fd: i32) -> Option<BrowserShim> {
     use std::os::unix::fs::PermissionsExt;
 
     let shim_dir = tempfile::Builder::new()
@@ -2038,7 +2653,7 @@ for arg in "$@"; do
 done
 
 if [ -n "$url_arg" ]; then
-    exec {quoted_helper} open-url-helper "$url_arg"
+    NONO_SUPERVISOR_FD={supervisor_fd} exec {quoted_helper} open-url-helper "$url_arg"
 else
     exec /usr/bin/open "$@"
 fi
@@ -2052,9 +2667,9 @@ fi
         return None;
     }
 
-    Some(OpenShim {
+    Some(BrowserShim {
         dir: shim_dir,
-        helper_exe: helper_path,
+        launcher: shim_path,
     })
 }
 
@@ -2154,50 +2769,55 @@ fn resolve_procfs_path_for_child(
     Ok(rewritten)
 }
 
-/// Enforce the supervisor's sensitive procfs deny rules.
+/// Enforce the supervisor's procfs deny rules before canonicalization.
 ///
-/// Same-process procfs access is allowed after `/proc/self` rewriting. Foreign
-/// process reads stay blocked.
+/// This must run on the resolved procfs path before `canonicalize()`, because
+/// procfs links such as `/proc/<pid>/fd/<n>` and `/proc/<pid>/cwd` would
+/// otherwise erase their `/proc` provenance during resolution.
 fn validate_procfs_access(
-    canonical: &Path,
+    resolved_path: &Path,
     procfs_context: Option<ProcfsAccessContext>,
 ) -> std::result::Result<(), OpenPathError> {
-    const SENSITIVE_PROC_FILES: &[&str] =
-        &["mem", "environ", "maps", "syscall", "stack", "cmdline"];
+    const SELF_BLOCKED_PROC_NAMES: &[&str] =
+        &["fd", "ns", "pagemap", "exe", "cwd", "root", "mountinfo"];
 
-    let Some(suffix) = canonical.to_str().and_then(|s| s.strip_prefix("/proc/")) else {
+    let Some(suffix) = resolved_path
+        .to_str()
+        .and_then(|s| s.strip_prefix("/proc/"))
+    else {
         return Ok(());
     };
 
     let allowed_pid = procfs_context.map(|ctx| ctx.process_pid.to_string());
     let components: Vec<&str> = suffix.split('/').collect();
 
-    if components.len() == 2
-        && components[0].chars().all(|c| c.is_ascii_digit())
-        && SENSITIVE_PROC_FILES.contains(&components[1])
+    if components.is_empty() || !components[0].chars().all(|c| c.is_ascii_digit()) {
+        return Ok(());
+    }
+
+    let (pid_component, sensitive_component) = if components.len() >= 4
+        && components[1] == "task"
+        && components[2].chars().all(|c| c.is_ascii_digit())
     {
-        if allowed_pid.as_deref() == Some(components[0]) {
-            return Ok(());
-        }
+        (components[0], components.get(3).copied())
+    } else {
+        (components[0], components.get(1).copied())
+    };
+
+    if allowed_pid.as_deref() != Some(pid_component) {
         return Err(OpenPathError::policy_blocked(format!(
-            "Access to /proc/{}/{} is blocked by policy",
-            components[0], components[1],
+            "Access to {} is blocked by policy",
+            resolved_path.display(),
         )));
     }
 
-    if components.len() == 4
-        && components[0].chars().all(|c| c.is_ascii_digit())
-        && components[1] == "task"
-        && components[2].chars().all(|c| c.is_ascii_digit())
-        && SENSITIVE_PROC_FILES.contains(&components[3])
-    {
-        if allowed_pid.as_deref() == Some(components[0]) {
-            return Ok(());
+    if let Some(component) = sensitive_component {
+        if SELF_BLOCKED_PROC_NAMES.contains(&component) {
+            return Err(OpenPathError::policy_blocked(format!(
+                "Access to {} is blocked by policy",
+                resolved_path.display(),
+            )));
         }
-        return Err(OpenPathError::policy_blocked(format!(
-            "Access to /proc/{}/task/{}/{} is blocked by policy",
-            components[0], components[2], components[3],
-        )));
     }
 
     Ok(())
@@ -2279,6 +2899,8 @@ fn open_path_for_access(
     let resolved_path = resolve_procfs_path_for_child(path, procfs_context)
         .map_err(|e| OpenPathError::internal(e.to_string()))?;
 
+    validate_procfs_access(&resolved_path, procfs_context)?;
+
     // Canonicalize to resolve symlinks before opening. This ensures
     // we check and open the real target, not a symlink alias.
     let canonical = std::fs::canonicalize(&resolved_path).map_err(|e| {
@@ -2302,8 +2924,6 @@ fn open_path_for_access(
             protected_root.display(),
         )));
     }
-
-    validate_procfs_access(&canonical, procfs_context)?;
 
     let file = open_canonical_path_no_symlinks(&canonical, access).map_err(|e| {
         OpenPathError::io(
@@ -2462,6 +3082,15 @@ fn open_canonical_path_no_symlinks(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_child_requires_dumpable_only_for_seccomp_driven_features() {
+        assert!(!linux_child_requires_dumpable(false, false));
+        assert!(linux_child_requires_dumpable(true, false));
+        assert!(linux_child_requires_dumpable(false, true));
+        assert!(linux_child_requires_dumpable(true, true));
+    }
+
     #[test]
     fn test_exec_strategy_default_is_supervised() {
         assert_eq!(ExecStrategy::default(), ExecStrategy::Supervised);
@@ -2612,6 +3241,85 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn test_validate_procfs_access_blocks_foreign_proc_fd_path() {
+        let result = validate_procfs_access(
+            Path::new("/proc/1/fd/3"),
+            Some(ProcfsAccessContext::new(4242, Some(4343))),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_procfs_access_blocks_child_proc_fd_path() {
+        let result = validate_procfs_access(
+            Path::new("/proc/4242/fd/3"),
+            Some(ProcfsAccessContext::new(4242, Some(4343))),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_procfs_access_blocks_foreign_proc_cwd_path_before_canonicalization() {
+        let result = validate_procfs_access(
+            Path::new("/proc/1/cwd"),
+            Some(ProcfsAccessContext::new(4242, Some(4343))),
+        );
+        assert!(result.is_err());
+    }
+
+    // --- Grandchild procfs regression tests (issue #602) ---
+    //
+    // When bun is a grandchild (nono→sh→bun), notifying_tgid=bun's PID (e.g. 1001),
+    // not the direct child sh's PID (e.g. 1000). These tests verify the fix uses
+    // the correct PID for /proc/self resolution and access validation.
+
+    #[test]
+    fn test_resolve_procfs_self_for_grandchild_tgid() {
+        // After the fix, process_pid=notifying_tgid=1001 (bun).
+        // /proc/self/maps must resolve to /proc/1001/maps, not /proc/1000/maps.
+        let path = resolve_procfs_path_for_child(
+            Path::new("/proc/self/maps"),
+            Some(ProcfsAccessContext::new(1001, Some(1001))),
+        );
+        assert_eq!(path.ok(), Some(PathBuf::from("/proc/1001/maps")));
+    }
+
+    #[test]
+    fn test_validate_procfs_access_allows_grandchild_own_path() {
+        // notifying_tgid=1001 (bun): accessing /proc/1001/maps is allowed.
+        let result = validate_procfs_access(
+            Path::new("/proc/1001/maps"),
+            Some(ProcfsAccessContext::new(1001, Some(1001))),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_procfs_access_blocks_grandchild_accessing_sibling() {
+        // notifying_tgid=1001 (bun): accessing /proc/1000/maps (sh's maps) is blocked.
+        // This verifies the fix does NOT allow cross-process procfs reads.
+        let result = validate_procfs_access(
+            Path::new("/proc/1000/maps"),
+            Some(ProcfsAccessContext::new(1001, Some(1001))),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_procfs_self_wrong_pid_demonstrates_bug() {
+        // Demonstrates the pre-fix bug: if process_pid=1000 (sh) but the requesting
+        // process is bun (1001), /proc/self/maps incorrectly resolves to /proc/1000/maps.
+        // After the fix, process_pid is always notifying_tgid, so this construction
+        // would never be used for bun's request.
+        let path = resolve_procfs_path_for_child(
+            Path::new("/proc/self/maps"),
+            Some(ProcfsAccessContext::new(1000, Some(1001))), // broken: sh's PID for bun's request
+        );
+        // This produces the wrong path (sh's maps instead of bun's maps).
+        assert_eq!(path.ok(), Some(PathBuf::from("/proc/1000/maps")));
+    }
+
     /// Verify that the supervisor loop runs and exits cleanly without a PTY relay.
     ///
     /// This tests the `capability_elevation = false` code path where no PTY is
@@ -2646,6 +3354,8 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test-session",
+            attach_initial_client: false,
+            detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
             allow_launch_services_active: false,
@@ -2653,6 +3363,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: &[],
         };
 
         // Fork a child that closes its socket end and exits immediately.
@@ -2674,6 +3386,7 @@ mod tests {
                     child,
                     &mut sock,
                     &sup_cfg,
+                    None, // no startup timeout
                     None, // no seccomp
                     None, // no proxy seccomp
                     &[],  // no initial caps
@@ -2683,7 +3396,8 @@ mod tests {
 
                 #[cfg(not(target_os = "linux"))]
                 let result = run_supervisor_loop(
-                    child, &mut sock, &sup_cfg, None, // no trust interceptor
+                    child, &mut sock, &sup_cfg, None, // no startup timeout
+                    None, // no trust interceptor
                     None, // no PTY relay
                 );
 
@@ -2740,6 +3454,8 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test-proxy-v4",
+            attach_initial_client: false,
+            detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
             allow_launch_services_active: false,
@@ -2747,6 +3463,8 @@ mod tests {
             proxy_port: 8080,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: &[],
         };
 
         match unsafe { fork() } {
@@ -2767,6 +3485,7 @@ mod tests {
                     child,
                     &mut sock,
                     &sup_cfg,
+                    None, // no startup timeout
                     None, // no openat seccomp
                     None, // no proxy seccomp — V4+ Landlock handles it
                     &[],  // no initial caps
@@ -2811,6 +3530,8 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
+            attach_initial_client: false,
+            detach_sequence: None,
             open_url_origins: &origins,
             open_url_allow_localhost: false,
             allow_launch_services_active: false,
@@ -2818,6 +3539,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: &[],
         };
 
         // Allowed origin: validation passes
@@ -2841,6 +3564,8 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
+            attach_initial_client: false,
+            detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
             allow_launch_services_active: false,
@@ -2848,6 +3573,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: &[],
         };
 
         let result = validate_url("file:///etc/passwd", &config);
@@ -2869,6 +3596,8 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
+            attach_initial_client: false,
+            detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: true,
             allow_launch_services_active: false,
@@ -2876,11 +3605,15 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: &[],
         };
         let config_deny = SupervisorConfig {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
+            attach_initial_client: false,
+            detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
             allow_launch_services_active: false,
@@ -2888,6 +3621,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: &[],
         };
 
         // Localhost denied when not allowed
@@ -2914,6 +3649,8 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
+            attach_initial_client: false,
+            detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
             allow_launch_services_active: false,
@@ -2921,6 +3658,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: &[],
         };
 
         let long_url = format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH));
@@ -2953,6 +3692,34 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_create_linux_browser_shim_installs_launcher_and_helper() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let shim = create_linux_browser_shim(&exe, 42).expect("create shim");
+
+        assert!(shim.launcher.exists(), "browser launcher should exist");
+        assert_eq!(
+            shim.launcher.parent(),
+            Some(shim.dir.path()),
+            "launcher should live inside shim dir"
+        );
+
+        let script = std::fs::read_to_string(&shim.launcher).expect("read shim");
+        assert!(
+            script.contains("nono-open-url-helper"),
+            "launcher should reference the copied helper"
+        );
+        assert!(
+            script.contains("NONO_SUPERVISOR_FD=42"),
+            "launcher should export the supervisor fd only for helper execution"
+        );
+        assert!(
+            script.contains("open-url-helper \"$@\""),
+            "launcher should exec the copied helper"
+        );
+    }
+
     #[test]
     fn test_clear_close_on_exec_clears_flag() {
         use std::os::fd::AsRawFd;
@@ -2976,27 +3743,25 @@ mod tests {
     #[test]
     fn test_create_open_shim_installs_helper_in_shim_dir() {
         let exe = std::env::current_exe().expect("current_exe");
-        let shim = create_open_shim(&exe).expect("create shim");
+        let shim = create_open_shim(&exe, 42).expect("create shim");
 
-        assert!(
-            shim.dir.path().join("open").exists(),
-            "open shim should exist"
-        );
-        assert!(shim.helper_exe.exists(), "helper copy should exist");
-        assert_eq!(
-            shim.helper_exe.parent(),
-            Some(shim.dir.path()),
-            "helper should live inside shim dir"
-        );
+        assert!(shim.launcher.exists(), "open shim should exist");
 
-        let script = std::fs::read_to_string(shim.dir.path().join("open")).expect("read shim");
-        let helper = shell_quote(&shim.helper_exe.display().to_string());
+        let script = std::fs::read_to_string(&shim.launcher).expect("read shim");
         assert!(
             script.contains("for arg in \"$@\"; do"),
             "shim should scan all arguments for a URL"
         );
         assert!(
-            script.contains(&format!("exec {helper} open-url-helper \"$url_arg\"")),
+            script.contains("nono-open-url-helper"),
+            "shim should reference the copied helper"
+        );
+        assert!(
+            script.contains("NONO_SUPERVISOR_FD=42"),
+            "shim should export the supervisor fd only for helper execution"
+        );
+        assert!(
+            script.contains("open-url-helper \"$url_arg\""),
             "shim should exec the copied helper"
         );
     }
@@ -3024,6 +3789,8 @@ mod tests {
             protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
+            attach_initial_client: false,
+            detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
             allow_launch_services_active: true,
@@ -3031,6 +3798,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            #[cfg(target_os = "linux")]
+            denied_socket_paths: &[],
         };
 
         assert!(
@@ -3047,7 +3816,7 @@ mod tests {
     #[test]
     fn test_open_shim_drop_cleans_up_directory() {
         let exe = std::env::current_exe().expect("current_exe");
-        let shim = create_open_shim(&exe).expect("create shim");
+        let shim = create_open_shim(&exe, 42).expect("create shim");
         let dir = shim.dir.path().to_path_buf();
 
         assert!(dir.exists(), "shim dir should exist before drop");

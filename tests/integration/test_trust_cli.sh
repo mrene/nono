@@ -413,6 +413,90 @@ expect_output_contains "export-key shows base64 public key" "MF" \
     with_test_env "$NONO_BIN" trust export-key --id "$KEY_ID"
 
 # =============================================================================
+# file:// backend (headless key storage)
+# =============================================================================
+
+echo ""
+echo "--- file:// Backend ---"
+
+FILE_DIR="$TMPDIR/file-backend"
+FILE_KEY_DIR="$TMPDIR/file-keys"
+mkdir -p "$FILE_DIR" "$FILE_KEY_DIR"
+
+FILE_KEYREF="file://$FILE_KEY_DIR/trust-key.pem"
+
+printf '# Test file-backed signing\n' > "$FILE_DIR/SKILLS.md"
+
+expect_success "trust keygen --keyref file:// creates key pair" \
+    with_test_env "$NONO_BIN" trust keygen --keyref "$FILE_KEYREF"
+
+run_test "file:// private key exists" 0 test -f "$FILE_KEY_DIR/trust-key.pem"
+run_test "file:// public key exists" 0 test -f "$FILE_KEY_DIR/trust-key.pem.pub"
+
+# Verify permissions are 0600
+PRIV_PERMS=$(stat -c '%a' "$FILE_KEY_DIR/trust-key.pem" 2>/dev/null || stat -f '%Lp' "$FILE_KEY_DIR/trust-key.pem")
+run_test "file:// private key has 0600 permissions" 0 test "$PRIV_PERMS" = "600"
+
+expect_failure "trust keygen --keyref file:// rejects duplicate without --force" \
+    with_test_env "$NONO_BIN" trust keygen --keyref "$FILE_KEYREF"
+
+expect_success "trust keygen --keyref file:// --force overwrites" \
+    with_test_env "$NONO_BIN" trust keygen --keyref "$FILE_KEYREF" --force
+
+expect_output_contains "trust export-key --keyref file:// returns base64" "MF" \
+    with_test_env "$NONO_BIN" trust export-key --keyref "$FILE_KEYREF"
+
+expect_output_contains "trust export-key --keyref file:// --pem returns PEM" "BEGIN PUBLIC KEY" \
+    with_test_env "$NONO_BIN" trust export-key --keyref "$FILE_KEYREF" --pem
+
+expect_in_dir_success "trust init --keyref file:// creates policy" "$FILE_DIR" \
+    with_test_env "$NONO_BIN" trust init --include SKILLS.md --keyref "$FILE_KEYREF"
+
+expect_file_contains "file:// init embeds publisher public key" "$FILE_DIR/trust-policy.json" '"public_key"'
+expect_file_contains "file:// init embeds file URI as key_id" "$FILE_DIR/trust-policy.json" "file://$FILE_KEY_DIR/trust-key.pem"
+
+expect_in_dir_success "trust sign-policy --keyref file:// succeeds" "$FILE_DIR" \
+    with_test_env "$NONO_BIN" trust sign-policy --keyref "$FILE_KEYREF"
+
+run_test "file:// sign-policy creates bundle" 0 test -f "$FILE_DIR/trust-policy.json.bundle"
+
+expect_success "trust sign --keyref file:// creates bundle" \
+    with_test_env "$NONO_BIN" trust sign "$FILE_DIR/SKILLS.md" --keyref "$FILE_KEYREF"
+
+run_test "file:// sign creates bundle" 0 test -f "$FILE_DIR/SKILLS.md.bundle"
+
+expect_in_dir_success_contains "trust verify succeeds with file:// signed artifacts" "$FILE_DIR" "VERIFIED" \
+    with_test_env "$NONO_BIN" trust verify SKILLS.md
+
+# Tamper detection
+printf '# tampered\n' >> "$FILE_DIR/SKILLS.md"
+expect_in_dir_failure_contains "trust verify detects tampering on file:// signed file" "$FILE_DIR" "digest" \
+    with_test_env "$NONO_BIN" trust verify SKILLS.md
+
+# Re-sign after edit
+expect_success "trust sign --keyref file:// re-signs after edit" \
+    with_test_env "$NONO_BIN" trust sign "$FILE_DIR/SKILLS.md" --keyref "$FILE_KEYREF"
+
+expect_in_dir_success_contains "trust verify succeeds after re-sign" "$FILE_DIR" "VERIFIED" \
+    with_test_env "$NONO_BIN" trust verify SKILLS.md
+
+# Key relocation: same key material at a different path is a different signer.
+# The trust policy records the full file:// URI as the publisher key_id, so
+# signing with a relocated copy fails publisher matching even though the
+# cryptographic key is identical. This is by design — use a stable path.
+RELOCATED_KEY_DIR="$TMPDIR/file-keys-relocated"
+mkdir -p "$RELOCATED_KEY_DIR"
+cp "$FILE_KEY_DIR/trust-key.pem" "$RELOCATED_KEY_DIR/trust-key.pem"
+cp "$FILE_KEY_DIR/trust-key.pem.pub" "$RELOCATED_KEY_DIR/trust-key.pem.pub"
+RELOCATED_KEYREF="file://$RELOCATED_KEY_DIR/trust-key.pem"
+
+expect_success "trust sign with relocated key succeeds (signing is key-material only)" \
+    with_test_env "$NONO_BIN" trust sign "$FILE_DIR/SKILLS.md" --keyref "$RELOCATED_KEYREF"
+
+expect_in_dir_failure_contains "trust verify rejects relocated-key signer (path-dependent identity)" "$FILE_DIR" "not in trusted publishers" \
+    with_test_env "$NONO_BIN" trust verify SKILLS.md
+
+# =============================================================================
 # Summary
 # =============================================================================
 

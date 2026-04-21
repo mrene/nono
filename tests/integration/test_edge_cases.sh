@@ -130,8 +130,15 @@ echo "--- Non-existent Paths ---"
 expect_output_contains "grant non-existent directory is skipped with warning" "Skipping non-existent path" \
     "$NONO_BIN" run --allow /nonexistent/path/that/does/not/exist/anywhere -- echo "should run"
 
-expect_output_contains "grant non-existent file is skipped with warning" "Skipping non-existent file" \
-    "$NONO_BIN" run --read-file /nonexistent/file.txt -- echo "should run"
+if is_macos; then
+    expect_success "grant non-existent file is retained on macOS" \
+        "$NONO_BIN" run --read-file /nonexistent/file.txt -- echo "should run"
+    expect_output_not_contains "grant non-existent file does not warn on macOS" "Skipping non-existent file" \
+        "$NONO_BIN" run --read-file /nonexistent/file.txt -- echo "should run"
+else
+    expect_output_contains "grant non-existent file is skipped with warning" "Skipping non-existent file" \
+        "$NONO_BIN" run --read-file /nonexistent/file.txt -- echo "should run"
+fi
 
 # Reading a file that doesn't exist (but directory is allowed) should give normal "not found" error
 expect_failure "read non-existent file in allowed dir gives file error" \

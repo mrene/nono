@@ -256,9 +256,9 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
         );
         root.insert("rollback".to_string(), serde_json::Value::Object(rollback));
 
-        // NOTE: open_urls and allow_launch_services are intentionally omitted.
-        // Emitting them would replace inherited values from base profiles like
-        // claude-code (which grants OAuth2 origins and launch services).
+        // NOTE: open_urls, allow_launch_services, and allow_gpu are intentionally
+        // omitted. Emitting them would replace inherited values from base profiles like
+        // claude-code (which grants OAuth2 origins, launch services, and GPU access).
         // Absent = inherit from base. Authors who need to override these
         // should add them explicitly.
     }
@@ -533,10 +533,11 @@ mod tests {
         assert!(full_obj.contains_key("hooks"));
         assert!(full_obj.contains_key("rollback"));
 
-        // open_urls and allow_launch_services are intentionally omitted
-        // to avoid silently overriding inherited values from base profiles
+        // open_urls, allow_launch_services, and allow_gpu are intentionally
+        // omitted to avoid silently overriding inherited values from base profiles
         assert!(!full_obj.contains_key("open_urls"));
         assert!(!full_obj.contains_key("allow_launch_services"));
+        assert!(!full_obj.contains_key("allow_gpu"));
 
         assert!(!minimal_obj.contains_key("policy"));
         assert!(!minimal_obj.contains_key("network"));

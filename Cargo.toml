@@ -31,7 +31,7 @@ tracing = "0.1"
 zeroize = { version = "1", features = ["alloc"] }
 
 # Hashing
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Filesystem walking
 walkdir = "2"

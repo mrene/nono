@@ -24,6 +24,7 @@ The execution model:
 3. The **parent** remains unsandboxed to provide supervisor services
 
 See [Execution Modes](/cli/features/execution-modes) for how this compares to Direct mode (`nono wrap`).
+For the operational runtime workflow built on top of supervisor mode, see [Session Lifecycle](/cli/features/session-lifecycle).
 
 ## Capability Expansion (Linux)
 
@@ -94,3 +95,4 @@ When the child exits with a non-zero exit code, nono prints a diagnostic footer 
 ## Limitations
 
 - Capability expansion is Linux-only. macOS supervised mode provides rollback snapshots and diagnostics only.
+- **WSL2**: Capability expansion (`--capability-elevation`) is unavailable. WSL2's init process claims the sole seccomp notify listener, causing `EBUSY` when nono tries to install its own ([microsoft/WSL#9548](https://github.com/microsoft/WSL/issues/9548)). Supervised mode still works for rollback snapshots and diagnostics. See [WSL2 Support](/cli/internals/wsl2#seccomp-user-notification-limitation) for details.

@@ -109,6 +109,10 @@ fn test_init_full_creates_all_additive_sections() {
         "allow_launch_services should be omitted"
     );
     assert!(
+        val.get("allow_gpu").is_none(),
+        "allow_gpu should be omitted"
+    );
+    assert!(
         val["network"].get("network_profile").is_none(),
         "network_profile should be omitted"
     );

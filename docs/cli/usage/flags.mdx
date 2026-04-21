@@ -328,6 +328,31 @@ Custom credentials can be defined in profiles for APIs not covered by the built-
 
 See [Credential Injection](/cli/features/credential-injection) for complete documentation including custom credential definitions.
 
+#### `--allow-endpoint`
+
+Restrict a credential service to specific HTTP method+path patterns. When set, only requests matching at least one rule are proxied; all others receive 403 Forbidden. Can be specified multiple times.
+
+Format: `SERVICE:METHOD:PATH`
+
+- **SERVICE**: credential service name (e.g., `openai`, `github`)
+- **METHOD**: HTTP method (`GET`, `POST`, etc.) or `*` for any method
+- **PATH**: URL path glob pattern (`*` matches one segment, `**` matches zero or more)
+
+```bash
+# Allow only chat completions through OpenAI
+nono run --allow-cwd --credential openai \
+  --allow-endpoint 'openai:POST:/v1/chat/completions' \
+  -- my-agent
+
+# Allow GitHub issue reads and comment writes, block everything else
+nono run --allow-cwd --credential github \
+  --allow-endpoint 'github:GET:/repos/*/issues/**' \
+  --allow-endpoint 'github:POST:/repos/*/issues/*/comments' \
+  -- my-agent
+```
+
+Endpoint rules can also be defined in profiles via `endpoint_rules` on custom credentials. See [Networking — Endpoint Filtering](/cli/features/networking#endpoint-filtering) for details.
+
 #### `--upstream-proxy`
 
 Chain outbound connections through an upstream (enterprise) proxy. Cloud metadata endpoints are still denied.
@@ -450,7 +475,9 @@ nono shell --allow-cwd --shell /bin/zsh
 
 #### `--allow-command`
 
-Allow a normally-blocked dangerous command. By default, destructive commands like `rm`, `dd`, `chmod` are blocked. Use this flag to override for a specific command.
+Deprecated in `v0.33.0`. Allows a normally-blocked startup command, but only for
+the directly-invoked executable. Child processes can bypass this check, so it
+should not be treated as a sandbox security boundary.
 
 ```bash
 # Allow rm (blocked by default)
@@ -461,14 +488,16 @@ nono run --allow-cwd --allow-command rm --allow-command mv -- my-script.sh
 ```
 
 <Note>
-  Even with `--allow-command`, the kernel sandbox still restricts file operations to granted paths. A command can only affect files within directories you explicitly allowed.
+  `--allow-command` and the default command blocklist are startup-only checks.
+  They do not prevent child processes, interpreters, language runtimes, shell
+  built-ins, renamed binaries, or equivalent APIs from performing the same
+  operation. For hard protection, rely on kernel-enforced path and network
+  controls such as `deny.access`, `deny.unlink`, narrower filesystem grants,
+  and network policy.
 </Note>
 
-<Note>
-  Command blocking is a best-effort surface-level control. It matches against the executable name being invoked directly. It does not prevent a process from performing the equivalent operation through language-level APIs (e.g., `os.remove()` in Python), shell built-ins, or renamed binaries. For hard protection against destructive filesystem operations, rely on kernel-enforced deny groups (`deny.access`, `deny.unlink`) and path-based sandboxing, which apply regardless of how the operation is invoked.
-</Note>
-
-Commands can also be allowed permanently via the `allowed_commands` field in a profile's security config:
+Commands can also be allowed temporarily via the deprecated `allowed_commands`
+field in a profile's security config:
 
 ```json
 {
@@ -484,7 +513,8 @@ nono run --profile my-profile -- rm /tmp/old-file.txt
 
 #### `--block-command`
 
-Block an additional command beyond the default blocklist.
+Deprecated in `v0.33.0`. Adds a startup-only command denylist entry for the
+directly-invoked executable. Child processes can bypass this check.
 
 ```bash
 # Block a custom tool in addition to defaults
@@ -619,7 +649,50 @@ nono run --profile claude-code --allow-launch-services -- claude
   `--allow-launch-services` is only supported on macOS. It requires the selected profile to opt into `allow_launch_services` and configure `open_urls`; otherwise nono fails closed with an error.
 </Note>
 
+#### `--allow-gpu`
+
+Allow GPU compute access for workloads like ML inference and shader compilation.
+
+- **macOS (Apple Silicon):** Grants scoped IOKit access for Metal GPU compute (IOGPU, AGX, IOSurface). Intel Macs are not yet supported.
+- **Linux:** Grants access to DRM render nodes (`/dev/dri/renderD*`), NVIDIA compute devices (`nvidia[0-N]`, `nvidiactl`, `nvidia-uvm`), NVIDIA MIG caps, AMD KFD (`/dev/kfd`), and WSL2 DirectX passthrough (`/dev/dxg`). Also grants read-only access to Vulkan ICD manifests and GPU sysfs.
+
+```bash
+nono run --allow-gpu -- llama-cli -m ./model.gguf -p "hello"
+```
+
+<Note>
+  When used with a profile, the profile must opt into `allow_gpu`; otherwise nono fails closed with an error. Without a profile, the CLI flag alone is sufficient.
+</Note>
+
 ### Execution Mode Flags
+
+#### `--detached`
+
+Start the supervised session without attaching the current terminal. The command keeps running in the background and can be resumed later with `nono attach <session>`.
+
+```bash
+# Start in the background, then attach later
+nono run --detached --profile claude-code --allow-cwd -- claude
+
+# Detached launch with an explicit session name
+nono run --detached --name gold-core --allow-cwd -- my-agent
+```
+
+Detached launches print the generated session ID and the attach command once the session becomes ready.
+
+#### `--name`
+
+Assign a human-friendly name to the supervised session. The name is shown in `nono ps` and can be used to recognize the session in later `attach`, `stop`, `logs`, and `inspect` workflows.
+
+```bash
+# Name a foreground supervised session
+nono run --name gold-core --allow-cwd -- my-agent
+
+# Combine with detached startup
+nono run --detached --name nightly-indexer --allow ./workspace -- indexer
+```
+
+Session names must be unique among live sessions. If you omit `--name`, nono generates a unique name automatically.
 
 #### `--rollback`
 
@@ -897,6 +970,7 @@ nono trust init                            # Scan root directory only
 nono trust init -r                         # Scan recursively
 nono trust init -r --exclude-dirs tmp logs # Exclude extra directories
 nono trust init --key my-key --force       # Specific key, overwrite existing
+nono trust init --keyref file:///path/to/key.pem  # File-backed key
 ```
 
 | Option | Description |
@@ -904,6 +978,7 @@ nono trust init --key my-key --force       # Specific key, overwrite existing
 | `-r`, `--recursive` | Scan subdirectories recursively |
 | `--exclude-dirs <DIR...>` | Additional directories to exclude (on top of `.gitignore` and built-in list) |
 | `--key <KEY_ID>` | Key ID to include as publisher (default: "default") |
+| `--keyref <URI>` | Key reference URI (`keystore://name` or `file:///path`). Conflicts with `--key` |
 | `--force` | Overwrite existing `trust-policy.json` |
 
 <Note>
@@ -918,12 +993,14 @@ Sign files, producing bundles for verification.
 nono trust sign <FILES...>                 # Sign specific files
 nono trust sign --all                      # Sign all instruction files in CWD
 nono trust sign SKILLS.md --key my-key     # Use a specific key
+nono trust sign SKILLS.md --keyref file:///path/to/key.pem  # File-backed key
 ```
 
 | Option | Description |
 |--------|-------------|
 | `--all` | Sign all instruction files matching trust policy patterns |
 | `--key <KEY_ID>` | Key ID from system keystore (default: "default") |
+| `--keyref <URI>` | Key reference URI (`keystore://name` or `file:///path`). Conflicts with `--key` and `--keyless` |
 | `--keyless` | Use Sigstore keyless signing (CI environments only) |
 | `--policy <FILE>` | Trust policy file (default: auto-discover) |
 
@@ -940,12 +1017,14 @@ nono trust sign-policy                     # Sign trust-policy.json in CWD
 nono trust sign-policy --user              # Sign user-level trust policy (~/.config/nono/)
 nono trust sign-policy path/to/policy.json # Sign specific file
 nono trust sign-policy --key my-key        # Use a specific key
+nono trust sign-policy --keyref file:///path/to/key.pem  # File-backed key
 ```
 
 | Option | Description |
 |--------|-------------|
 | `--user` | Sign the user-level trust policy at `~/.config/nono/trust-policy.json`. The user-level policy anchors trust — without it, project-level policies are not authoritative |
 | `--key <KEY_ID>` | Key ID from system keystore (default: "default") |
+| `--keyref <URI>` | Key reference URI (`keystore://name` or `file:///path`). Conflicts with `--key` |
 
 ### `nono trust verify`
 
@@ -968,12 +1047,19 @@ nono trust list --json                     # JSON output
 
 ### `nono trust keygen`
 
-Generate an ECDSA P-256 signing key pair and store it in the system keystore.
+Generate an ECDSA P-256 signing key pair.
 
 ```bash
-nono trust keygen                          # Default key ID ("default")
-nono trust keygen --id my-signing-key      # Named key
+nono trust keygen                          # Default key ID ("default") in system keystore
+nono trust keygen --id my-signing-key      # Named key in system keystore
+nono trust keygen --keyref file:///path/to/key.pem  # File-backed key
 ```
+
+| Option | Description |
+|--------|-------------|
+| `--id <NAME>` | Key identifier in system keystore (default: "default") |
+| `--keyref <URI>` | Key reference URI (`keystore://name` or `file:///path`). Conflicts with `--id` |
+| `--force` | Overwrite existing key |
 
 ### `nono trust export-key`
 
@@ -982,8 +1068,15 @@ Export the public key for use in trust policy `public_key` fields.
 ```bash
 nono trust export-key                      # Export default key (base64 DER)
 nono trust export-key --id my-key          # Export named key
+nono trust export-key --keyref file:///path/to/key.pem  # Export from file-backed key
 nono trust export-key --pem                # Output as PEM format
 ```
+
+| Option | Description |
+|--------|-------------|
+| `--id <NAME>` | Key identifier in system keystore (default: "default") |
+| `--keyref <URI>` | Key reference URI (`keystore://name` or `file:///path`). Conflicts with `--id` |
+| `--pem` | Output as PEM instead of base64 DER |
 
 ## `nono setup` Options
 

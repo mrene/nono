@@ -8,7 +8,9 @@
   },
   "favicon": "/assets/logo.png",
   "colors": {
-    "primary": "#6366F1"
+    "primary": "#e8724a",
+    "light": "#e8724a",
+    "dark": "#e8724a"
   },
   "appearance": {
     "default": "dark"
@@ -30,6 +32,7 @@
         "pages": [
           "cli/getting_started/installation",
           "cli/getting_started/quickstart",
+          "cli/usage/developer-workflows",
           "cli/usage/examples",
           "cli/usage/troubleshooting"
         ]
@@ -37,6 +40,8 @@
       {
         "group": "Features",
         "pages": [
+          "cli/features/package-publishing",
+          "cli/features/session-lifecycle",
           "cli/features/profiles-groups",
           "cli/features/profile-authoring",
           "cli/features/atomic-rollbacks",
@@ -44,7 +49,7 @@
           "cli/features/supervisor",
           "cli/features/networking",
           "cli/features/credential-injection",
-          "cli/features/execution-modes",
+          "cli/features/environment",
           "cli/features/policy-introspection",
           "cli/features/learn",
           "cli/features/trust"
@@ -63,9 +68,12 @@
         "group": "Platform Internals",
         "pages": [
           "cli/internals/index",
+          "cli/features/execution-modes",
           "cli/internals/security-model",
           "cli/internals/landlock",
           "cli/internals/seatbelt",
+          "cli/internals/wsl2",
+          "cli/internals/wsl2-feature-matrix",
           "cli/internals/application",
           "cli/internals/signing",
           "cli/internals/containers"

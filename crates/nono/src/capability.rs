@@ -5,7 +5,7 @@
 
 use crate::error::{NonoError, Result};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Source of a filesystem capability for diagnostics
 ///
@@ -359,18 +359,19 @@ fn tokenize_sexp(input: &str) -> Result<Vec<String>> {
 /// outside its own sandbox.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SignalMode {
-    /// Signals restricted to the current process only.
+    /// Signals restricted to the current sandbox.
     ///
-    /// On macOS: `(allow signal (target self))` in Seatbelt — restricts
-    /// `kill()` to the calling process's own PID. Forked children within
-    /// the same sandbox are **not** included; the parent cannot signal
-    /// them via `kill()`. Terminal-generated signals (e.g., Ctrl+C
-    /// delivering SIGINT to the foreground process group) are delivered
-    /// by the kernel and bypass the sandbox filter.
+    /// On macOS: emits `(allow signal (target self))` and
+    /// `(allow signal (target same-sandbox))` in Seatbelt — permits
+    /// `kill()` on the process itself and on any child that inherited the
+    /// same sandbox. External processes cannot be signaled. Terminal-
+    /// generated signals (e.g., Ctrl+C delivering SIGINT to the foreground
+    /// process group) are delivered by the kernel and bypass the sandbox.
     ///
-    /// On Linux: best-effort. Landlock V6 `LANDLOCK_SCOPE_SIGNAL` restricts
-    /// signaling to processes in the same sandbox, which is stronger than no
-    /// filtering but not equivalent to "self only".
+    /// On Linux: Landlock V6 `LANDLOCK_SCOPE_SIGNAL` restricts signaling
+    /// to processes in the same sandbox. Landlock cannot distinguish "self
+    /// only" from "same sandbox", so `Isolated` and `AllowSameSandbox`
+    /// produce identical enforcement.
     #[default]
     Isolated,
     /// Signals allowed to child processes in the same sandbox only.
@@ -394,9 +395,14 @@ pub enum SignalMode {
 /// outside its own sandbox.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProcessInfoMode {
-    /// Process inspection restricted to the current process only.
+    /// Process inspection restricted to the current sandbox.
     ///
-    /// On macOS: emits `(deny process-info* (target others))` in Seatbelt.
+    /// On macOS: emits `(allow process-info* (target self))` and
+    /// `(allow process-info* (target same-sandbox))` in Seatbelt — permits
+    /// inspection of the process itself and children that inherited the
+    /// sandbox, while blocking inspection of external processes.
+    ///
+    /// On Linux: no-op (Landlock does not restrict process inspection).
     #[default]
     Isolated,
     /// Process inspection allowed for child processes in the same sandbox only.
@@ -539,6 +545,10 @@ pub struct CapabilitySet {
     /// `sandbox_extension_consume()` tokens can expand the sandbox dynamically.
     /// On Linux, this flag is informational (seccomp-notify is installed separately).
     extensions_enabled: bool,
+    /// Enable macOS Seatbelt denial logging for supervised diagnostics.
+    /// When set, the generated Seatbelt profile emits `(debug deny)` so
+    /// sandboxd records denial events in the unified log.
+    seatbelt_debug_deny: bool,
 }
 
 impl CapabilitySet {
@@ -805,6 +815,11 @@ impl CapabilitySet {
         self.extensions_enabled = enabled;
     }
 
+    /// Enable or disable macOS Seatbelt denial logging.
+    pub fn set_seatbelt_debug_deny(&mut self, enabled: bool) {
+        self.seatbelt_debug_deny = enabled;
+    }
+
     /// Add to allowed commands list
     pub fn add_allowed_command(&mut self, cmd: impl Into<String>) {
         self.allowed_commands.push(cmd.into());
@@ -847,6 +862,50 @@ impl CapabilitySet {
     #[must_use]
     pub fn fs_capabilities(&self) -> &[FsCapability] {
         &self.fs
+    }
+
+    /// Rewrite self-referential procfs capabilities for a specific process.
+    ///
+    /// This is needed when capabilities are prepared in one process and then
+    /// applied in a different child after `fork()`. Paths such as `/proc/self`
+    /// and `/dev/fd` must resolve to the sandboxed child, not the parent that
+    /// originally canonicalized them.
+    pub fn remap_procfs_self_references(&mut self, process_pid: u32, thread_pid: Option<u32>) {
+        for cap in &mut self.fs {
+            if let Some(rewritten) =
+                rewrite_procfs_self_reference(&cap.original, process_pid, thread_pid)
+            {
+                cap.resolved = rewritten;
+            }
+        }
+        self.deduplicate();
+    }
+
+    /// Widen `/proc/<pid>` READ-only Landlock rules to `/proc` so that
+    /// grandchild processes can access their own procfs entries.
+    ///
+    /// This is needed because Landlock rules are fixed at sandbox setup time with
+    /// the direct child's PID. When a grandchild (e.g. nono→sh→bun) forks, it
+    /// gets a new PID and its `/proc/self` resolves to a different inode than the
+    /// direct child's `/proc/<sh_pid>`. By widening to `/proc`, we allow any
+    /// descendant to read its own procfs entries.
+    ///
+    /// Only applies to READ capabilities at the `/proc/self` level (not
+    /// subdirectories like `/proc/self/fd` which may have write access).
+    pub fn widen_procfs_self_to_proc(&mut self) {
+        for cap in &mut self.fs {
+            if cap.access == AccessMode::Read {
+                let is_proc_self_dir = cap
+                    .original
+                    .to_str()
+                    .map(|s| s == "/proc/self" || s == "/proc/self/")
+                    .unwrap_or(false);
+                if is_proc_self_dir {
+                    cap.resolved = std::path::PathBuf::from("/proc");
+                }
+            }
+        }
+        self.deduplicate();
     }
 
     /// Check if network access is blocked
@@ -907,6 +966,12 @@ impl CapabilitySet {
     #[must_use]
     pub fn extensions_enabled(&self) -> bool {
         self.extensions_enabled
+    }
+
+    /// Check whether macOS Seatbelt denial logging is enabled.
+    #[must_use]
+    pub fn seatbelt_debug_deny(&self) -> bool {
+        self.seatbelt_debug_deny
     }
 
     /// Get allowed commands
@@ -1092,6 +1157,121 @@ impl CapabilitySet {
         }
 
         lines.join("\n")
+    }
+}
+
+fn rewrite_procfs_self_reference(
+    original: &Path,
+    process_pid: u32,
+    thread_pid: Option<u32>,
+) -> Option<PathBuf> {
+    let thread_pid = thread_pid.unwrap_or(process_pid);
+
+    match original {
+        path if path == Path::new("/dev/fd") => {
+            return Some(PathBuf::from(format!("/proc/{process_pid}/fd")));
+        }
+        path if path == Path::new("/dev/stdin") => {
+            return Some(PathBuf::from(format!("/proc/{process_pid}/fd/0")));
+        }
+        path if path == Path::new("/dev/stdout") => {
+            return Some(PathBuf::from(format!("/proc/{process_pid}/fd/1")));
+        }
+        path if path == Path::new("/dev/stderr") => {
+            return Some(PathBuf::from(format!("/proc/{process_pid}/fd/2")));
+        }
+        _ => {}
+    }
+
+    let mut components = original.components();
+    if components.next() != Some(Component::RootDir)
+        || components.next() != Some(Component::Normal(std::ffi::OsStr::new("proc")))
+    {
+        return None;
+    }
+
+    let proc_component = components.next()?;
+    let mut rewritten = PathBuf::from("/proc");
+
+    match proc_component {
+        Component::Normal(part) if part == std::ffi::OsStr::new("self") => {
+            rewritten.push(process_pid.to_string());
+        }
+        Component::Normal(part) if part == std::ffi::OsStr::new("thread-self") => {
+            rewritten.push(process_pid.to_string());
+            rewritten.push("task");
+            rewritten.push(thread_pid.to_string());
+        }
+        _ => return None,
+    }
+
+    for component in components {
+        match component {
+            Component::Normal(part) => rewritten.push(part),
+            Component::CurDir => rewritten.push("."),
+            Component::ParentDir => rewritten.push(".."),
+            Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+
+    Some(rewritten)
+}
+
+#[cfg(test)]
+mod procfs_remap_tests {
+    use super::*;
+
+    #[test]
+    fn remap_procfs_self_rewrites_proc_self_capability() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/proc/self"),
+            resolved: PathBuf::from("/proc/111/self-was-parent"),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::Group("system_read_linux".to_string()),
+        });
+
+        caps.remap_procfs_self_references(4242, None);
+
+        assert_eq!(
+            caps.fs_capabilities()[0].original,
+            PathBuf::from("/proc/self")
+        );
+        assert_eq!(
+            caps.fs_capabilities()[0].resolved,
+            PathBuf::from("/proc/4242")
+        );
+    }
+
+    #[test]
+    fn remap_procfs_self_rewrites_dev_fd_aliases() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/dev/fd"),
+            resolved: PathBuf::from("/proc/111/fd"),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::Group("system_read_linux".to_string()),
+        });
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/dev/stdout"),
+            resolved: PathBuf::from("/proc/111/fd/1"),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Group("system_read_linux".to_string()),
+        });
+
+        caps.remap_procfs_self_references(4242, None);
+
+        assert_eq!(
+            caps.fs_capabilities()[0].resolved,
+            PathBuf::from("/proc/4242/fd")
+        );
+        assert_eq!(
+            caps.fs_capabilities()[1].resolved,
+            PathBuf::from("/proc/4242/fd/1")
+        );
     }
 }
 
@@ -1536,6 +1716,25 @@ mod tests {
         assert!(caps
             .add_platform_rule("(deny file-read* (subpath \"/usr))")
             .is_err());
+    }
+
+    #[test]
+    fn test_platform_rule_validation_accepts_gpu_iokit_rules() {
+        let mut caps = CapabilitySet::new();
+        // Minimal IOKit surface: AGXDeviceUserClient is the only class required
+        // for Metal compute on Apple Silicon. IOSurfaceRootUserClient is tried
+        // opportunistically but Metal continues without it when denied.
+        assert!(caps
+            .add_platform_rule(
+                "(allow iokit-open \
+                    (iokit-user-client-class \
+                        \"AGXDeviceUserClient\"))"
+            )
+            .is_ok());
+        assert!(caps
+            .add_platform_rule("(allow iokit-get-properties)")
+            .is_ok());
+        assert_eq!(caps.platform_rules().len(), 2);
     }
 
     // NetworkMode tests
